@@ -2,11 +2,11 @@ import { eq, and, desc, sql, count, gte, lte, between } from "drizzle-orm";
 import { drizzle } from "drizzle-orm/mysql2";
 import {
   users, departments, employees, clients, tasks, dailyReports,
-  trelloSettings, activityLog, alerts, chatMessages,
+  trelloSettings, activityLog, alerts, chatMessages, comments,
   type InsertUser, type InsertDepartment, type InsertEmployee,
   type InsertClient, type InsertTask, type InsertDailyReport,
   type InsertTrelloSetting, type InsertActivityLog, type InsertAlert,
-  type InsertChatMessage,
+  type InsertChatMessage, type InsertComment,
 } from "../drizzle/schema";
 import * as schema from "../drizzle/schema";
 import { ENV } from './_core/env';
@@ -56,6 +56,13 @@ export async function getUserByOpenId(openId: string) {
   const db = await getDb();
   if (!db) return undefined;
   const result = await db.select().from(users).where(eq(users.openId, openId)).limit(1);
+  return result.length > 0 ? result[0] : undefined;
+}
+
+export async function getUserByEmail(email: string) {
+  const db = await getDb();
+  if (!db) return undefined;
+  const result = await db.select().from(users).where(eq(users.email, email)).limit(1);
   return result.length > 0 ? result[0] : undefined;
 }
 
@@ -472,4 +479,90 @@ export async function linkUserToEmployee(userId: number, employeeId: number) {
   const db = await getDb();
   await db.update(employees).set({ userId }).where(eq(employees.id, employeeId));
   return { success: true };
+}
+
+
+// ---- Comments / Issues ----
+export async function createComment(data: { userId: number; title?: string; content: string; type?: string; priority?: string }) {
+  const db = await getDb();
+  await db.insert(comments).values(data as any);
+  return { success: true };
+}
+
+export async function getAllComments() {
+  const db = await getDb();
+  const rows = await db
+    .select({
+      id: comments.id,
+      userId: comments.userId,
+      title: comments.title,
+      content: comments.content,
+      type: comments.type,
+      priority: comments.priority,
+      status: comments.status,
+      resolvedById: comments.resolvedById,
+      resolvedAt: comments.resolvedAt,
+      createdAt: comments.createdAt,
+      userName: users.name,
+    })
+    .from(comments)
+    .leftJoin(users, eq(comments.userId, users.id))
+    .orderBy(desc(comments.createdAt));
+
+  // Also get resolvedByName
+  const result = [];
+  for (const row of rows) {
+    let resolvedByName = null;
+    if (row.resolvedById) {
+      const resolver = await db.select({ name: users.name }).from(users).where(eq(users.id, row.resolvedById)).limit(1);
+      resolvedByName = resolver[0]?.name || null;
+    }
+    result.push({ ...row, resolvedByName });
+  }
+  return result;
+}
+
+export async function updateCommentStatus(id: number, status: string, resolvedById?: number) {
+  const db = await getDb();
+  const updateData: any = { status };
+  if (status === 'resolved' && resolvedById) {
+    updateData.resolvedById = resolvedById;
+    updateData.resolvedAt = new Date();
+  }
+  await db.update(comments).set(updateData).where(eq(comments.id, id));
+  return { success: true };
+}
+
+// ---- Activity Log (all entries) ----
+export async function getAllActivityLogs(limit: number = 200) {
+  const db = await getDb();
+  const rows = await db
+    .select({
+      id: activityLog.id,
+      employeeId: activityLog.employeeId,
+      taskId: activityLog.taskId,
+      action: activityLog.action,
+      details: activityLog.details,
+      trelloCardId: activityLog.trelloCardId,
+      fromStatus: activityLog.fromStatus,
+      toStatus: activityLog.toStatus,
+      timestamp: activityLog.timestamp,
+      employeeName: employees.name,
+    })
+    .from(activityLog)
+    .leftJoin(employees, eq(activityLog.employeeId, employees.id))
+    .orderBy(desc(activityLog.timestamp))
+    .limit(limit);
+
+  // Enrich with task title
+  const result = [];
+  for (const row of rows) {
+    let taskTitle = null;
+    if (row.taskId) {
+      const task = await db.select({ title: tasks.title }).from(tasks).where(eq(tasks.id, row.taskId)).limit(1);
+      taskTitle = task[0]?.title || null;
+    }
+    result.push({ ...row, taskTitle });
+  }
+  return result;
 }

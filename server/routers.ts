@@ -1,4 +1,7 @@
 import { COOKIE_NAME } from "@shared/const";
+import { ONE_YEAR_MS } from "@shared/const";
+import { sdk } from "./_core/sdk";
+import { verifyPassword } from "./_core/password";
 import { getSessionCookieOptions } from "./_core/cookies";
 import { systemRouter } from "./_core/systemRouter";
 import { publicProcedure, router, protectedProcedure } from "./_core/trpc";
@@ -15,12 +18,32 @@ import {
   logActivity, getActivityByEmployee,
   createAlert, getAlerts, markAlertRead, getUnreadAlertCount,
   saveChatMessage, getChatHistory,
-  getAllUsers, updateUserRole, linkUserToEmployee,
+  getAllUsers, updateUserRole, linkUserToEmployee, getUserByEmail,
+  createComment, getAllComments, updateCommentStatus, getAllActivityLogs,
 } from "./db";
 import { getTrelloService, syncEmployeeBoard } from "./trello";
 import { generateDailyReport as aiGenerateDailyReport, analyzePerformance, checkDeadlines } from "./ai-agent";
 import { invokeLLM } from "./_core/llm";
 import type { User } from "../drizzle/schema";
+import { answerHelpQuestion } from "./helpCenterAI";
+import {
+  addFeedback as addHelpFeedback,
+  createArticle as createHelpArticle,
+  createChatSession as createHelpChatSession,
+  deleteArticle as deleteHelpArticle,
+  getAllArticles as getAllHelpArticles,
+  getArticleBySlug as getHelpArticleBySlug,
+  getArticleFeedback as getHelpArticleFeedback,
+  getArticleViewCount as getHelpArticleViewCount,
+  getChatHistory as getHelpChatHistory,
+  getChatSession as getHelpChatSession,
+  getPinnedArticles as getHelpPinnedArticles,
+  getRecentUpdates as getHelpRecentUpdates,
+  recordView as recordHelpView,
+  searchArticles as searchHelpArticles,
+  updateArticle as updateHelpArticle,
+} from "./helpCenterDb";
+
 
 // Role hierarchy for permission checks
 const ROLE_HIERARCHY: Record<string, number> = {
@@ -62,6 +85,35 @@ async function getVisibleEmployeeIds(user: User): Promise<number[] | 'all'> {
   return [employee.id];
 }
 
+
+const helpArticleSchema = z.object({
+  title: z.string().min(1).max(255),
+  titleAr: z.string().max(255).optional(),
+  slug: z.string().min(1).max(255),
+  content: z.string().min(1),
+  contentAr: z.string().optional(),
+  category: z.string().min(1),
+  tags: z.array(z.string()).optional(),
+  isPublished: z.boolean().optional(),
+  isPinned: z.boolean().optional(),
+  version: z.string().max(20).optional(),
+});
+
+async function enrichHelpArticle(article: Awaited<ReturnType<typeof getAllHelpArticles>>[number]) {
+  const [viewCount, feedback] = await Promise.all([
+    getHelpArticleViewCount(article.id),
+    getHelpArticleFeedback(article.id),
+  ]);
+  const totalVotes = feedback.helpful + feedback.notHelpful;
+  return {
+    ...article,
+    viewCount,
+    helpful: feedback.helpful,
+    notHelpful: feedback.notHelpful,
+    helpfulPercentage: totalVotes > 0 ? Math.round((feedback.helpful / totalVotes) * 100) : 0,
+  };
+}
+
 export const appRouter = router({
   system: systemRouter,
 
@@ -72,6 +124,25 @@ export const appRouter = router({
       ctx.res.clearCookie(COOKIE_NAME, { ...cookieOptions, maxAge: -1 });
       return { success: true } as const;
     }),
+    login: publicProcedure
+      .input(z.object({ email: z.string().email(), password: z.string().min(1) }))
+      .mutation(async ({ ctx, input }) => {
+        const user = await getUserByEmail(input.email);
+        if (!user || !user.password) {
+          throw new TRPCError({ code: "UNAUTHORIZED", message: "Invalid email or password" });
+        }
+        const valid = verifyPassword(input.password, user.password);
+        if (!valid) {
+          throw new TRPCError({ code: "UNAUTHORIZED", message: "Invalid email or password" });
+        }
+        const sessionToken = await sdk.createSessionToken(user.openId, {
+          name: user.name || "",
+          expiresInMs: ONE_YEAR_MS,
+        });
+        const cookieOptions = getSessionCookieOptions(ctx.req);
+        ctx.res.cookie(COOKIE_NAME, sessionToken, { ...cookieOptions, maxAge: ONE_YEAR_MS });
+        return { success: true } as const;
+      }),
   }),
 
   // ---- Departments ----
@@ -414,6 +485,127 @@ export const appRouter = router({
     history: protectedProcedure
       .input(z.object({ limit: z.number().optional() }).optional())
       .query(({ ctx, input }) => getChatHistory(ctx.user.id, input?.limit || 50)),
+  }),
+
+
+  // ---- Help Center ----
+  helpCenter: router({
+    listArticles: protectedProcedure
+      .input(z.object({ category: z.string().optional(), published: z.boolean().optional() }))
+      .query(async ({ ctx, input }) => {
+        const canManageHelp = ["admin", "super_admin"].includes(ctx.user.role);
+        const published = canManageHelp ? input.published : true;
+        const articles = await getAllHelpArticles({ category: input.category, published });
+        return Promise.all(articles.map(enrichHelpArticle));
+      }),
+    getArticle: protectedProcedure
+      .input(z.object({ slug: z.string() }))
+      .query(async ({ ctx, input }) => {
+        const article = await getHelpArticleBySlug(input.slug);
+        if (!article || (!article.isPublished && !["admin", "super_admin"].includes(ctx.user.role))) {
+          throw new TRPCError({ code: "NOT_FOUND", message: "Help article not found." });
+        }
+        await recordHelpView(article.id, ctx.user.id);
+        return enrichHelpArticle(article);
+      }),
+    searchArticles: protectedProcedure
+      .input(z.object({ query: z.string().min(2) }))
+      .query(async ({ input }) => {
+        const articles = await searchHelpArticles(input.query);
+        return Promise.all(articles.map(enrichHelpArticle));
+      }),
+    getPinnedArticles: protectedProcedure.query(async () => {
+      const articles = await getHelpPinnedArticles();
+      return Promise.all(articles.map(enrichHelpArticle));
+    }),
+    getRecentUpdates: protectedProcedure
+      .input(z.object({ limit: z.number().int().positive().max(20).optional() }))
+      .query(async ({ input }) => {
+        const articles = await getHelpRecentUpdates(input.limit);
+        return Promise.all(articles.map(enrichHelpArticle));
+      }),
+    getCategories: protectedProcedure.query(async () => {
+      const articles = await getAllHelpArticles({ published: true });
+      const counts = new Map<string, number>();
+      for (const article of articles) {
+        counts.set(article.category, (counts.get(article.category) || 0) + 1);
+      }
+      return Array.from(counts.entries())
+        .map(([category, count]) => ({ category, count }))
+        .sort((a, b) => a.category.localeCompare(b.category));
+    }),
+    submitFeedback: protectedProcedure
+      .input(z.object({ articleId: z.number().int().positive(), helpful: z.boolean(), comment: z.string().max(500).optional() }))
+      .mutation(async ({ ctx, input }) => {
+        await addHelpFeedback({ articleId: input.articleId, helpful: input.helpful, comment: input.comment, userId: ctx.user.id });
+        return { success: true };
+      }),
+    startChat: protectedProcedure.mutation(async ({ ctx }) => {
+      return createHelpChatSession(ctx.user.id);
+    }),
+    sendMessage: protectedProcedure
+      .input(z.object({ sessionKey: z.string(), message: z.string().min(1).max(1000) }))
+      .mutation(async ({ ctx, input }) => {
+        const answer = await answerHelpQuestion(input.message, input.sessionKey, ctx.user.id);
+        const history = await getHelpChatHistory(input.sessionKey);
+        return { answer: answer.answer, sources: answer.sources, history };
+      }),
+    getChatHistory: protectedProcedure
+      .input(z.object({ sessionKey: z.string() }))
+      .query(async ({ ctx, input }) => {
+        const session = await getHelpChatSession(input.sessionKey);
+        if (!session || (session.userId && session.userId !== ctx.user.id)) {
+          throw new TRPCError({ code: "NOT_FOUND", message: "Chat session not found." });
+        }
+        return getHelpChatHistory(input.sessionKey);
+      }),
+    createArticle: superAdminProcedure
+      .input(helpArticleSchema)
+      .mutation(async ({ ctx, input }) => {
+        return createHelpArticle({ ...input, authorId: ctx.user.id });
+      }),
+    updateArticle: superAdminProcedure
+      .input(z.object({ id: z.number().int().positive(), data: helpArticleSchema.partial() }))
+      .mutation(async ({ input }) => {
+        return updateHelpArticle(input.id, input.data);
+      }),
+    deleteArticle: superAdminProcedure
+      .input(z.number().int().positive())
+      .mutation(async ({ input }) => {
+        await deleteHelpArticle(input);
+        return { success: true };
+      }),
+  }),
+
+  // ---- Comments / Issues ----
+  comments: router({
+    list: protectedProcedure.query(async () => {
+      return getAllComments();
+    }),
+    create: protectedProcedure
+      .input(z.object({
+        title: z.string().max(255).optional(),
+        content: z.string().min(1),
+        type: z.enum(["comment", "issue", "feedback"]).optional(),
+        priority: z.enum(["low", "medium", "high"]).optional(),
+      }))
+      .mutation(async ({ ctx, input }) => {
+        return createComment({ userId: ctx.user.id, ...input });
+      }),
+    updateStatus: teamLeaderProcedure
+      .input(z.object({ id: z.number(), status: z.enum(["open", "in_progress", "resolved"]) }))
+      .mutation(async ({ ctx, input }) => {
+        return updateCommentStatus(input.id, input.status, ctx.user.id);
+      }),
+  }),
+
+  // ---- Activity Logs ----
+  activityLogs: router({
+    list: managementProcedure
+      .input(z.object({ limit: z.number().optional() }).optional())
+      .query(async ({ input }) => {
+        return getAllActivityLogs(input?.limit || 200);
+      }),
   }),
 
   // ---- User Management ----

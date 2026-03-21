@@ -18,6 +18,7 @@ export const users = mysqlTable("users", {
   openId: varchar("openId", { length: 64 }).notNull().unique(),
   name: text("name"),
   email: varchar("email", { length: 320 }),
+  password: varchar("password", { length: 255 }),
   loginMethod: varchar("loginMethod", { length: 64 }),
   role: mysqlEnum("role", [
     "employee",
@@ -50,6 +51,7 @@ export const employees = mysqlTable("employees", {
   name: varchar("name", { length: 255 }).notNull(),
   nameAr: varchar("nameAr", { length: 255 }),
   email: varchar("email", { length: 320 }),
+  password: varchar("password", { length: 255 }),
   phone: varchar("phone", { length: 50 }),
   departmentId: int("departmentId").notNull(), // FK to departments.id
   position: varchar("position", { length: 100 }),
@@ -284,3 +286,85 @@ export type InsertAlert = typeof alerts.$inferInsert;
 
 export type ChatMessage = typeof chatMessages.$inferSelect;
 export type InsertChatMessage = typeof chatMessages.$inferInsert;
+// Help Center tables
+export const helpArticles = mysqlTable("help_articles", {
+  id: int("id").autoincrement().primaryKey(),
+  title: varchar("title", { length: 255 }).notNull(),
+  titleAr: varchar("titleAr", { length: 255 }),
+  slug: varchar("slug", { length: 255 }).notNull().unique(),
+  content: text("content").notNull(),
+  contentAr: text("contentAr"),
+  category: varchar("category", { length: 100 }).notNull(),
+  tags: text("tags"),
+  isPublished: boolean("isPublished").default(true).notNull(),
+  isPinned: boolean("isPinned").default(false).notNull(),
+  version: varchar("version", { length: 20 }),
+  authorId: int("authorId").references(() => users.id, { onDelete: "set null" }),
+  createdAt: timestamp("createdAt").defaultNow().notNull(),
+  updatedAt: timestamp("updatedAt").defaultNow().onUpdateNow().notNull(),
+});
+
+export const helpArticleViews = mysqlTable("help_article_views", {
+  id: int("id").autoincrement().primaryKey(),
+  articleId: int("articleId").notNull().references(() => helpArticles.id, { onDelete: "cascade" }),
+  userId: int("userId").references(() => users.id, { onDelete: "set null" }),
+  viewedAt: timestamp("viewedAt").defaultNow().notNull(),
+});
+
+export const helpFeedback = mysqlTable("help_feedback", {
+  id: int("id").autoincrement().primaryKey(),
+  articleId: int("articleId").notNull().references(() => helpArticles.id, { onDelete: "cascade" }),
+  userId: int("userId").references(() => users.id, { onDelete: "set null" }),
+  helpful: boolean("helpful").notNull(),
+  comment: text("comment"),
+  createdAt: timestamp("createdAt").defaultNow().notNull(),
+});
+
+export const helpChatSessions = mysqlTable("help_chat_sessions", {
+  id: int("id").autoincrement().primaryKey(),
+  userId: int("userId").references(() => users.id, { onDelete: "set null" }),
+  sessionKey: varchar("sessionKey", { length: 100 }).notNull().unique(),
+  createdAt: timestamp("createdAt").defaultNow().notNull(),
+});
+
+export const helpChatMessages = mysqlTable("help_chat_messages", {
+  id: int("id").autoincrement().primaryKey(),
+  sessionId: int("sessionId").notNull().references(() => helpChatSessions.id, { onDelete: "cascade" }),
+  role: mysqlEnum("role", ["user", "assistant"]).notNull(),
+  content: text("content").notNull(),
+  sources: text("sources"),
+  createdAt: timestamp("createdAt").defaultNow().notNull(),
+});
+
+// Comments / Issues table
+export const comments = mysqlTable("comments", {
+  id: int("id").autoincrement().primaryKey(),
+  userId: int("userId").notNull(),
+  title: varchar("title", { length: 255 }),
+  content: text("content").notNull(),
+  type: mysqlEnum("type", ["comment", "issue", "feedback"]).default("comment"),
+  priority: mysqlEnum("priority", ["low", "medium", "high"]).default("medium"),
+  status: mysqlEnum("status", ["open", "in_progress", "resolved"]).default("open"),
+  resolvedById: int("resolvedById"),
+  resolvedAt: timestamp("resolvedAt"),
+  createdAt: timestamp("createdAt").defaultNow(),
+});
+
+// Type exports for new tables
+export type HelpArticle = typeof helpArticles.$inferSelect;
+export type InsertHelpArticle = typeof helpArticles.$inferInsert;
+
+export type HelpArticleView = typeof helpArticleViews.$inferSelect;
+export type InsertHelpArticleView = typeof helpArticleViews.$inferInsert;
+
+export type HelpFeedback = typeof helpFeedback.$inferSelect;
+export type InsertHelpFeedback = typeof helpFeedback.$inferInsert;
+
+export type HelpChatSession = typeof helpChatSessions.$inferSelect;
+export type InsertHelpChatSession = typeof helpChatSessions.$inferInsert;
+
+export type HelpChatMessage = typeof helpChatMessages.$inferSelect;
+export type InsertHelpChatMessage = typeof helpChatMessages.$inferInsert;
+
+export type Comment = typeof comments.$inferSelect;
+export type InsertComment = typeof comments.$inferInsert;

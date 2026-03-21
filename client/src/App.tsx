@@ -17,8 +17,17 @@ import MyReportsPage from "./pages/MyReportsPage";
 import TrelloSettingsPage from "./pages/TrelloSettingsPage";
 import UserManagementPage from "./pages/UserManagementPage";
 import AlertsPage from "./pages/AlertsPage";
+import HelpCenterPage from "./pages/HelpCenterPage";
+import HelpArticlePage from "./pages/HelpArticlePage";
+import HelpAdminPage from "./pages/HelpAdminPage";
+import CommentsPage from "./pages/CommentsPage";
+import ActivityLogPage from "./pages/ActivityLogPage";
+import { useAuth } from "./_core/hooks/useAuth";
+
 
 function Router() {
+  const { user } = useAuth();
+
   return (
     <DashboardLayout>
       <Switch>
@@ -34,6 +43,13 @@ function Router() {
         <Route path="/settings/trello" component={TrelloSettingsPage} />
         <Route path="/settings/users" component={UserManagementPage} />
         <Route path="/alerts" component={AlertsPage} />
+        <Route path="/help" component={HelpCenterPage} />
+        <Route path="/help/:slug" component={HelpArticlePage} />
+        {user && ["admin", "super_admin"].includes(user.role) ? (
+          <Route path="/help/admin" component={HelpAdminPage} />
+        ) : null}
+        <Route path="/issues" component={CommentsPage} />
+        <Route path="/activity-log" component={ActivityLogPage} />
         <Route path="/404" component={NotFound} />
         <Route component={NotFound} />
       </Switch>
