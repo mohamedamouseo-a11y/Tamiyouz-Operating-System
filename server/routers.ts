@@ -248,10 +248,46 @@ export const appRouter = router({
         const targets = visible === 'all' ? all : all.filter(e => (visible as number[]).includes(e.id));
         const results = await Promise.allSettled(targets.map(e => aiGenerateDailyReport(e.id, input.date)));
         return { success: true, generated: results.filter(r => r.status === 'fulfilled').length, failed: results.filter(r => r.status === 'rejected').length };
-      }),
-  }),
+        }),
+      refreshAll: teamLeaderProcedure
+        .input(z.object({ date: z.string() }))
+        .mutation(async ({ ctx, input }) => {
+          const all = await getAllEmployees();
+          const visible = await getVisibleEmployeeIds(ctx.user);
+          const targets = visible === 'all' ? all : all.filter(e => (visible as number[]).includes(e.id));
 
-  // ---- Trello Settings ----
+          // Step 1: Sync Trello boards for employees that have one configured
+          const syncTargets = targets.filter(e => e.trelloBoardId);
+          let syncedCount = 0;
+          let syncErrors = 0;
+          if (syncTargets.length > 0) {
+            try {
+              const syncResults = await Promise.allSettled(
+                syncTargets.map(e => syncEmployeeBoard(e.id))
+              );
+              syncedCount = syncResults.filter(r => r.status === 'fulfilled').length;
+              syncErrors = syncResults.filter(r => r.status === 'rejected').length;
+            } catch {
+              // Trello settings may not be configured, continue to report generation
+            }
+          }
+
+          // Step 2: Generate AI reports for all visible employees
+          const genResults = await Promise.allSettled(
+            targets.map(e => aiGenerateDailyReport(e.id, input.date))
+          );
+
+          return {
+            success: true,
+            trelloSynced: syncedCount,
+            trelloErrors: syncErrors,
+            reportsGenerated: genResults.filter(r => r.status === 'fulfilled').length,
+            reportsFailed: genResults.filter(r => r.status === 'rejected').length,
+          };
+        }),
+    }),
+
+    // ---- Trello Settings ----
   trelloSettings: router({
     get: superAdminProcedure.query(() => getTrelloSettings()),
     save: superAdminProcedure
