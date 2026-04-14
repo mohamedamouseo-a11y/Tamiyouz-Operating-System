@@ -183,7 +183,7 @@ export async function triggerGithubSync(
     const { stdout: porcelain } = await execAsync("git status --porcelain", { cwd });
     if (porcelain.trim()) {
       emit({ type: "log", level: "info", message: "\u25b8 Recording changes" });
-      await execAsync(`git ${_c} -m "${commitMsg.replace(/"/g, '\\"')}"`, { cwd });
+      await runGitStreaming([_c, "-m", commitMsg], cwd, mask, emit);
       emit({ type: "progress", message: "Changes recorded", progress: 55 });
     } else {
       emit({ type: "log", level: "info", message: "Nothing new to record" });

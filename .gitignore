@@ -119,3 +119,6 @@ temp/
 
 # Scripts with tokens
 push-to-github.sh
+
+# Manus AI tooling artifacts
+.manus/
