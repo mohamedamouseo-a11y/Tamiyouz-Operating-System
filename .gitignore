@@ -116,3 +116,6 @@ temp/
 # Add seed data files with real tokens here if needed:
 # server/data/trello-board-seed.json
 # server/data/trello-board-raw-from-excel.json
+
+# Scripts with tokens
+push-to-github.sh
