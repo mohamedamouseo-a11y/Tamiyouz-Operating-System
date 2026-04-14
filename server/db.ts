@@ -1,9 +1,9 @@
 import { eq, and, desc, sql, count, gte, lte, between } from "drizzle-orm";
 import { drizzle } from "drizzle-orm/mysql2";
 import {
-  users, departments, employees, clients, tasks, dailyReports,
+  users, departments, departmentWorkspaces, employees, clients, tasks, dailyReports,
   trelloSettings, activityLog, alerts, chatMessages, comments,
-  type InsertUser, type InsertDepartment, type InsertEmployee,
+  type InsertUser, type InsertDepartment, type InsertDepartmentWorkspace, type InsertEmployee,
   type InsertClient, type InsertTask, type InsertDailyReport,
   type InsertTrelloSetting, type InsertActivityLog, type InsertAlert,
   type InsertChatMessage, type InsertComment,
@@ -97,6 +97,62 @@ export async function deleteDepartment(id: number) {
   return { success: true };
 }
 
+// ---- Department Workspace Functions ----
+
+export async function getWorkspacesByDepartment(departmentId: number) {
+  const db = await getDb();
+  return db
+    .select()
+    .from(departmentWorkspaces)
+    .where(eq(departmentWorkspaces.departmentId, departmentId))
+    .orderBy(departmentWorkspaces.name);
+}
+
+export async function getAllDepartmentWorkspaces() {
+  const db = await getDb();
+  return db
+    .select({
+      id: departmentWorkspaces.id,
+      departmentId: departmentWorkspaces.departmentId,
+      name: departmentWorkspaces.name,
+      trelloWorkspaceId: departmentWorkspaces.trelloWorkspaceId,
+      apiKey: departmentWorkspaces.apiKey,
+      apiToken: departmentWorkspaces.apiToken,
+      isActive: departmentWorkspaces.isActive,
+      createdAt: departmentWorkspaces.createdAt,
+      updatedAt: departmentWorkspaces.updatedAt,
+      departmentName: departments.name,
+      departmentNameAr: departments.nameAr,
+    })
+    .from(departmentWorkspaces)
+    .leftJoin(departments, eq(departmentWorkspaces.departmentId, departments.id))
+    .orderBy(departments.name, departmentWorkspaces.name);
+}
+
+export async function getWorkspaceById(id: number) {
+  const db = await getDb();
+  const result = await db.select().from(departmentWorkspaces).where(eq(departmentWorkspaces.id, id)).limit(1);
+  return result[0] || null;
+}
+
+export async function createDepartmentWorkspace(data: Omit<InsertDepartmentWorkspace, 'id'>) {
+  const db = await getDb();
+  const result = await db.insert(departmentWorkspaces).values(data);
+  return { id: result[0].insertId, ...data };
+}
+
+export async function updateDepartmentWorkspace(id: number, data: Partial<InsertDepartmentWorkspace>) {
+  const db = await getDb();
+  await db.update(departmentWorkspaces).set(data).where(eq(departmentWorkspaces.id, id));
+  return getWorkspaceById(id);
+}
+
+export async function deleteDepartmentWorkspace(id: number) {
+  const db = await getDb();
+  await db.delete(departmentWorkspaces).where(eq(departmentWorkspaces.id, id));
+  return { success: true };
+}
+
 // ---- Employee Functions ----
 
 export async function getAllEmployees() {
@@ -104,12 +160,14 @@ export async function getAllEmployees() {
   const result = await db.select({
     id: employees.id, userId: employees.userId, name: employees.name, nameAr: employees.nameAr,
     email: employees.email, phone: employees.phone, departmentId: employees.departmentId,
-    position: employees.position, trelloBoardId: employees.trelloBoardId,
-    trelloBoardUrl: employees.trelloBoardUrl, isActive: employees.isActive,
+    position: employees.position, departmentWorkspaceId: employees.departmentWorkspaceId,
+    trelloBoardId: employees.trelloBoardId, trelloBoardUrl: employees.trelloBoardUrl, isActive: employees.isActive,
     createdAt: employees.createdAt, updatedAt: employees.updatedAt,
     departmentName: departments.name, departmentNameAr: departments.nameAr,
+    departmentWorkspaceName: departmentWorkspaces.name,
   }).from(employees)
     .leftJoin(departments, eq(employees.departmentId, departments.id))
+    .leftJoin(departmentWorkspaces, eq(employees.departmentWorkspaceId, departmentWorkspaces.id))
     .orderBy(employees.name);
   return result;
 }
@@ -119,12 +177,14 @@ export async function getEmployeeById(id: number) {
   const result = await db.select({
     id: employees.id, userId: employees.userId, name: employees.name, nameAr: employees.nameAr,
     email: employees.email, phone: employees.phone, departmentId: employees.departmentId,
-    position: employees.position, trelloBoardId: employees.trelloBoardId,
-    trelloBoardUrl: employees.trelloBoardUrl, isActive: employees.isActive,
+    position: employees.position, departmentWorkspaceId: employees.departmentWorkspaceId,
+    trelloBoardId: employees.trelloBoardId, trelloBoardUrl: employees.trelloBoardUrl, isActive: employees.isActive,
     createdAt: employees.createdAt, updatedAt: employees.updatedAt,
     departmentName: departments.name, departmentNameAr: departments.nameAr,
+    departmentWorkspaceName: departmentWorkspaces.name,
   }).from(employees)
     .leftJoin(departments, eq(employees.departmentId, departments.id))
+    .leftJoin(departmentWorkspaces, eq(employees.departmentWorkspaceId, departmentWorkspaces.id))
     .where(eq(employees.id, id)).limit(1);
   return result[0] || null;
 }
@@ -141,12 +201,14 @@ export async function getEmployeeByUserId(userId: number) {
   const result = await db.select({
     id: employees.id, userId: employees.userId, name: employees.name, nameAr: employees.nameAr,
     email: employees.email, phone: employees.phone, departmentId: employees.departmentId,
-    position: employees.position, trelloBoardId: employees.trelloBoardId,
-    trelloBoardUrl: employees.trelloBoardUrl, isActive: employees.isActive,
+    position: employees.position, departmentWorkspaceId: employees.departmentWorkspaceId,
+    trelloBoardId: employees.trelloBoardId, trelloBoardUrl: employees.trelloBoardUrl, isActive: employees.isActive,
     createdAt: employees.createdAt, updatedAt: employees.updatedAt,
     departmentName: departments.name,
+    departmentWorkspaceName: departmentWorkspaces.name,
   }).from(employees)
     .leftJoin(departments, eq(employees.departmentId, departments.id))
+    .leftJoin(departmentWorkspaces, eq(employees.departmentWorkspaceId, departmentWorkspaces.id))
     .where(eq(employees.userId, userId)).limit(1);
   return result[0] || null;
 }
@@ -565,4 +627,46 @@ export async function getAllActivityLogs(limit: number = 200) {
     result.push({ ...row, taskTitle });
   }
   return result;
+}
+
+// ---- Developer Hub Settings ----
+import { developerHubSettings } from "../drizzle/schema";
+
+export async function getDeveloperHubSettingsRow() {
+  const db = await getDb();
+  if (!db) return null;
+  const result = await db.select().from(developerHubSettings).limit(1);
+  return result[0] ?? null;
+}
+
+export async function saveDeveloperHubSettingsRow(data: {
+  repoPath?: string;
+  githubRepo?: string;
+  githubTokenEncrypted?: string;
+  defaultBranch?: string;
+  isEnabled?: boolean;
+}) {
+  const db = await getDb();
+  if (!db) throw new Error("DB unavailable");
+  const existing = await getDeveloperHubSettingsRow();
+  if (existing) {
+    await db.update(developerHubSettings).set({ ...data }).where(eq(developerHubSettings.id, existing.id));
+  } else {
+    await db.insert(developerHubSettings).values({
+      repoPath: data.repoPath ?? "",
+      githubRepo: data.githubRepo ?? "",
+      githubTokenEncrypted: data.githubTokenEncrypted ?? null,
+      defaultBranch: data.defaultBranch ?? "main",
+      isEnabled: data.isEnabled ?? true,
+    });
+  }
+}
+
+export async function updateDeveloperHubLastPush() {
+  const db = await getDb();
+  if (!db) return;
+  const existing = await getDeveloperHubSettingsRow();
+  if (existing) {
+    await db.update(developerHubSettings).set({ lastPushAt: new Date() }).where(eq(developerHubSettings.id, existing.id));
+  }
 }

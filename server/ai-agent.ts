@@ -19,40 +19,73 @@ export async function generateDailyReport(employeeId: number, date: string) {
   const tasks = await getTasksByEmployee(employeeId, date);
   const completedTasks = tasks.filter(t => t.status === 'done');
   const inProgressTasks = tasks.filter(t => t.status === 'in_progress');
-
-  const completedStr = completedTasks.length > 0
-    ? completedTasks.map(t => `- ${t.title} (${t.actualHours || 0}h) - Client: ${t.clientName || 'N/A'}`).join('\n')
-    : 'No tasks completed.';
-
-  const inProgressStr = inProgressTasks.length > 0
-    ? inProgressTasks.map(t => `- ${t.title} (${t.actualHours || 0}h)`).join('\n')
-    : 'No tasks in progress.';
-
-  const prompt = `Generate a daily work report for ${employee.name} on ${date}.
-
-Tasks completed:
-${completedStr}
-
-Tasks in progress:
-${inProgressStr}
-
-Provide a brief professional summary. Then list tasks in a table format:
-Date | Client | Task Description | Hours Spent | Status
-
-Match the language of the data (Arabic names stay Arabic).`;
-
-  const result = await invokeLLM({
-    messages: [
-      {
-        role: 'system',
-        content: 'You are a professional work report generator for Tamiyouz digital marketing agency (التميز ليس مهارة بل موقف). Generate concise, professional daily reports. Respond in the same language as the data.'
-      },
-      { role: 'user', content: prompt }
-    ]
-  });
-
-  const summary = (result.choices[0]?.message?.content as string) || 'Report generation failed.';
+  const reviewTasks = tasks.filter(t => t.status === 'review');
+  const todoTasks = tasks.filter(t => t.status === 'todo');
   const totalHours = tasks.reduce((sum, t) => sum + (Number(t.actualHours) || 0), 0);
+  const totalTasks = tasks.length;
+  const completionRate = totalTasks > 0 ? Math.round((completedTasks.length / totalTasks) * 100) : 0;
+
+  // Group tasks by client
+  const clientBreakdown: Array<{ client: string; done: number; inProgress: number; pending: number; hours: number }> = [];
+  const clientMap = new Map<string, { done: number; inProgress: number; pending: number; hours: number }>();
+  for (const t of tasks) {
+    const client = t.clientName || 'Unassigned';
+    if (!clientMap.has(client)) clientMap.set(client, { done: 0, inProgress: 0, pending: 0, hours: 0 });
+    const entry = clientMap.get(client)!;
+    if (t.status === 'done') entry.done++;
+    else if (t.status === 'in_progress') entry.inProgress++;
+    else entry.pending++;
+    entry.hours += Number(t.actualHours) || 0;
+  }
+  for (const [client, data] of clientMap) {
+    clientBreakdown.push({ client, ...data });
+  }
+  clientBreakdown.sort((a, b) => (b.done + b.inProgress) - (a.done + a.inProgress));
+
+  // Build task list (max 30 most relevant tasks)
+  const orderedTasks = [...completedTasks, ...inProgressTasks, ...reviewTasks, ...todoTasks];
+  const taskList = orderedTasks.slice(0, 30).map(t => ({
+    title: (t.title || 'Untitled').substring(0, 80),
+    client: t.clientName || 'Unassigned',
+    hours: Number(t.actualHours) || 0,
+    status: t.status,
+  }));
+
+  // Smart insight
+  let insight = '';
+  if (totalTasks === 0) {
+    insight = 'No tasks recorded for this date.';
+  } else if (completionRate >= 80) {
+    insight = `Excellent performance! ${completionRate}% completion rate.`;
+  } else if (completionRate >= 50) {
+    insight = `Good progress. Over half of tasks completed.`;
+  } else if (completedTasks.length > 0) {
+    insight = `Needs follow-up. Only ${completionRate}% completion rate.`;
+  } else if (inProgressTasks.length > 0) {
+    insight = `Tasks are in progress, none completed yet.`;
+  } else {
+    insight = `All tasks are pending.`;
+  }
+
+  // Store structured JSON as summary
+  const structuredData = {
+    version: 2,
+    stats: {
+      total: totalTasks,
+      done: completedTasks.length,
+      inProgress: inProgressTasks.length,
+      review: reviewTasks.length,
+      todo: todoTasks.length,
+      completionRate,
+      totalHours: parseFloat(totalHours.toFixed(2)),
+    },
+    insight,
+    tasks: taskList,
+    clientBreakdown: clientBreakdown.length > 1 ? clientBreakdown : [],
+    remainingTasks: Math.max(0, orderedTasks.length - 30),
+  };
+
+  const summary = JSON.stringify(structuredData);
 
   await createOrUpdateDailyReport({
     employeeId,
@@ -143,7 +176,6 @@ export async function checkDeadlines(): Promise<void> {
     const tasks = await getTasksByEmployee(employee.id);
 
     for (const task of tasks) {
-      // Check overdue: task date is before today and not done
       if (task.date < today && task.status !== 'done' && task.status !== 'review') {
         await createAlert({
           employeeId: employee.id,
@@ -155,7 +187,6 @@ export async function checkDeadlines(): Promise<void> {
         });
       }
 
-      // Check over-estimated hours
       if (task.estimatedHours && task.actualHours &&
           Number(task.actualHours) > Number(task.estimatedHours) * 1.5) {
         await createAlert({

@@ -10,9 +10,12 @@ import {
   date,
   primaryKey,
   unique,
+  double,
+  index,
+  uniqueIndex,
+  json,
 } from "drizzle-orm/mysql-core";
 import { relations } from "drizzle-orm";
-
 export const users = mysqlTable("users", {
   id: int("id").autoincrement().primaryKey(),
   openId: varchar("openId", { length: 64 }).notNull().unique(),
@@ -45,6 +48,27 @@ export const departments = mysqlTable("departments", {
   updatedAt: timestamp("updatedAt").defaultNow().onUpdateNow().notNull(),
 });
 
+export const departmentWorkspaces = mysqlTable(
+  "department_workspaces",
+  {
+    id: int("id").autoincrement().primaryKey(),
+    departmentId: int("departmentId").references(() => departments.id, {
+      onDelete: "set null",
+    }),
+    name: varchar("name", { length: 191 }).notNull(),
+    trelloWorkspaceId: varchar("trelloWorkspaceId", { length: 255 }),
+    apiKey: varchar("apiKey", { length: 255 }).notNull(),
+    apiToken: text("apiToken").notNull(),
+    isActive: boolean("isActive").default(true).notNull(),
+    createdAt: timestamp("createdAt").defaultNow().notNull(),
+    updatedAt: timestamp("updatedAt").defaultNow().onUpdateNow().notNull(),
+  },
+  (table) => ({
+    nameIdx: uniqueIndex("department_workspaces_name_unique").on(table.name),
+    departmentIdx: index("department_workspaces_department_idx").on(table.departmentId),
+  }),
+);
+
 export const employees = mysqlTable("employees", {
   id: int("id").autoincrement().primaryKey(),
   userId: int("userId").unique(), // FK to users.id
@@ -55,6 +79,9 @@ export const employees = mysqlTable("employees", {
   phone: varchar("phone", { length: 50 }),
   departmentId: int("departmentId").notNull(), // FK to departments.id
   position: varchar("position", { length: 100 }),
+  departmentWorkspaceId: int("departmentWorkspaceId").references(() => departmentWorkspaces.id, {
+    onDelete: "set null",
+  }),
   trelloBoardId: varchar("trelloBoardId", { length: 255 }),
   trelloBoardUrl: varchar("trelloBoardUrl", { length: 500 }),
   isActive: boolean("isActive").default(true),
@@ -175,6 +202,121 @@ export const chatMessages = mysqlTable("chat_messages", {
   createdAt: timestamp("createdAt").defaultNow().notNull(),
 });
 
+// =============================================
+// Client Area Tables (NEW)
+// =============================================
+
+export const clientServices = mysqlTable(
+  "client_services",
+  {
+    id: int("id").autoincrement().primaryKey(),
+    clientId: int("clientId")
+      .notNull()
+      .references(() => clients.id, { onDelete: "cascade" }),
+    service: varchar("service", { length: 100 }).notNull(),
+  },
+  (table) => ({
+    clientIdx: index("client_services_client_idx").on(table.clientId),
+    uniqueClientService: uniqueIndex("client_services_unique").on(
+      table.clientId,
+      table.service,
+    ),
+  }),
+);
+
+export const clientIntegrations = mysqlTable(
+  "client_integrations",
+  {
+    id: int("id").autoincrement().primaryKey(),
+    clientId: int("clientId")
+      .notNull()
+      .references(() => clients.id, { onDelete: "cascade" }),
+    service: varchar("service", { length: 100 }).notNull(),
+    integrationType: varchar("integrationType", { length: 100 }).notNull(),
+    displayName: varchar("displayName", { length: 191 }).notNull(),
+    externalId: varchar("externalId", { length: 191 }),
+    status: varchar("status", { length: 50 }).notNull().default("active"),
+    metadata: json("metadata").$type<Record<string, unknown> | null>().default(null),
+    createdAt: timestamp("createdAt").defaultNow().notNull(),
+    updatedAt: timestamp("updatedAt").defaultNow().onUpdateNow().notNull(),
+  },
+  (table) => ({
+    clientIdx: index("client_integrations_client_idx").on(table.clientId),
+    serviceIdx: index("client_integrations_service_idx").on(table.service),
+    typeIdx: index("client_integrations_type_idx").on(table.integrationType),
+  }),
+);
+
+export const clientAssignments = mysqlTable(
+  "client_assignments",
+  {
+    id: int("id").autoincrement().primaryKey(),
+    clientId: int("clientId")
+      .notNull()
+      .references(() => clients.id, { onDelete: "cascade" }),
+    employeeId: int("employeeId").references(() => employees.id, {
+      onDelete: "cascade",
+    }),
+    departmentId: int("departmentId").references(() => departments.id, {
+      onDelete: "cascade",
+    }),
+  },
+  (table) => ({
+    clientIdx: index("client_assignments_client_idx").on(table.clientId),
+    employeeIdx: index("client_assignments_employee_idx").on(table.employeeId),
+    departmentIdx: index("client_assignments_department_idx").on(table.departmentId),
+    uniqueClientEmployee: uniqueIndex("client_assignments_client_employee_unique").on(
+      table.clientId,
+      table.employeeId,
+    ),
+    uniqueClientDepartment: uniqueIndex("client_assignments_client_department_unique").on(
+      table.clientId,
+      table.departmentId,
+    ),
+  }),
+);
+
+export const clientNotes = mysqlTable(
+  "client_notes",
+  {
+    id: int("id").autoincrement().primaryKey(),
+    clientId: int("clientId")
+      .notNull()
+      .references(() => clients.id, { onDelete: "cascade" }),
+    authorId: int("authorId")
+      .notNull()
+      .references(() => users.id, { onDelete: "cascade" }),
+    content: text("content").notNull(),
+    createdAt: timestamp("createdAt").defaultNow().notNull(),
+  },
+  (table) => ({
+    clientIdx: index("client_notes_client_idx").on(table.clientId),
+    authorIdx: index("client_notes_author_idx").on(table.authorId),
+    createdIdx: index("client_notes_created_idx").on(table.createdAt),
+  }),
+);
+
+export const clientKpis = mysqlTable(
+  "client_kpis",
+  {
+    id: int("id").autoincrement().primaryKey(),
+    clientId: int("clientId")
+      .notNull()
+      .references(() => clients.id, { onDelete: "cascade" }),
+    metricName: varchar("metricName", { length: 120 }).notNull(),
+    metricValue: double("metricValue").notNull(),
+    date: date("date", { mode: "string" }).notNull(),
+    recordedById: int("recordedById")
+      .notNull()
+      .references(() => users.id, { onDelete: "cascade" }),
+  },
+  (table) => ({
+    clientIdx: index("client_kpis_client_idx").on(table.clientId),
+    metricIdx: index("client_kpis_metric_idx").on(table.metricName),
+    dateIdx: index("client_kpis_date_idx").on(table.date),
+  }),
+);
+
 // Relations
 export const usersRelations = relations(users, ({ one, many }) => ({
   employee: one(employees, {
@@ -183,10 +325,13 @@ export const usersRelations = relations(users, ({ one, many }) => ({
   }),
   approvedReports: many(dailyReports),
   chatMessages: many(chatMessages),
+  clientNotes: many(clientNotes),
+  clientKpis: many(clientKpis),
 }));
 
 export const departmentsRelations = relations(departments, ({ many }) => ({
   employees: many(employees),
+  clientAssignments: many(clientAssignments),
 }));
 
 export const employeesRelations = relations(employees, ({ one, many }) => ({
@@ -202,10 +347,16 @@ export const employeesRelations = relations(employees, ({ one, many }) => ({
   dailyReports: many(dailyReports),
   activityLog: many(activityLog),
   alerts: many(alerts),
+  clientAssignments: many(clientAssignments),
 }));
 
 export const clientsRelations = relations(clients, ({ many }) => ({
   tasks: many(tasks),
+  services: many(clientServices),
+  integrations: many(clientIntegrations),
+  assignments: many(clientAssignments),
+  notes: many(clientNotes),
+  kpis: many(clientKpis),
 }));
 
 export const tasksRelations = relations(tasks, ({ one, many }) => ({
@@ -256,12 +407,67 @@ export const chatMessagesRelations = relations(chatMessages, ({ one }) => ({
   }),
 }));
 
+// Client Area Relations (NEW)
+export const clientServicesRelations = relations(clientServices, ({ one }) => ({
+  client: one(clients, {
+    fields: [clientServices.clientId],
+    references: [clients.id],
+  }),
+}));
+
+export const clientIntegrationsRelations = relations(clientIntegrations, ({ one }) => ({
+  client: one(clients, {
+    fields: [clientIntegrations.clientId],
+    references: [clients.id],
+  }),
+}));
+
+export const clientAssignmentsRelations = relations(clientAssignments, ({ one }) => ({
+  client: one(clients, {
+    fields: [clientAssignments.clientId],
+    references: [clients.id],
+  }),
+  employee: one(employees, {
+    fields: [clientAssignments.employeeId],
+    references: [employees.id],
+  }),
+  department: one(departments, {
+    fields: [clientAssignments.departmentId],
+    references: [departments.id],
+  }),
+}));
+
+export const clientNotesRelations = relations(clientNotes, ({ one }) => ({
+  client: one(clients, {
+    fields: [clientNotes.clientId],
+    references: [clients.id],
+  }),
+  author: one(users, {
+    fields: [clientNotes.authorId],
+    references: [users.id],
+  }),
+}));
+
+export const clientKpisRelations = relations(clientKpis, ({ one }) => ({
+  client: one(clients, {
+    fields: [clientKpis.clientId],
+    references: [clients.id],
+  }),
+  recordedBy: one(users, {
+    fields: [clientKpis.recordedById],
+    references: [users.id],
+  }),
+}));
+
 // Export types for Drizzle ORM
 export type User = typeof users.$inferSelect;
 export type InsertUser = typeof users.$inferInsert;
 
 export type Department = typeof departments.$inferSelect;
 export type InsertDepartment = typeof departments.$inferInsert;
+
+export type DepartmentWorkspace = typeof departmentWorkspaces.$inferSelect;
+export type InsertDepartmentWorkspace = typeof departmentWorkspaces.$inferInsert;
 
 export type Employee = typeof employees.$inferSelect;
 export type InsertEmployee = typeof employees.$inferInsert;
@@ -286,6 +492,22 @@ export type InsertAlert = typeof alerts.$inferInsert;
 
 export type ChatMessage = typeof chatMessages.$inferSelect;
 export type InsertChatMessage = typeof chatMessages.$inferInsert;
+
+export type ClientService = typeof clientServices.$inferSelect;
+export type InsertClientService = typeof clientServices.$inferInsert;
+
+export type ClientIntegration = typeof clientIntegrations.$inferSelect;
+export type InsertClientIntegration = typeof clientIntegrations.$inferInsert;
+
+export type ClientAssignment = typeof clientAssignments.$inferSelect;
+export type InsertClientAssignment = typeof clientAssignments.$inferInsert;
+
+export type ClientNote = typeof clientNotes.$inferSelect;
+export type InsertClientNote = typeof clientNotes.$inferInsert;
+
+export type ClientKpi = typeof clientKpis.$inferSelect;
+export type InsertClientKpi = typeof clientKpis.$inferInsert;
+
 // Help Center tables
 export const helpArticles = mysqlTable("help_articles", {
   id: int("id").autoincrement().primaryKey(),
@@ -368,3 +590,19 @@ export type InsertHelpChatMessage = typeof helpChatMessages.$inferInsert;
 
 export type Comment = typeof comments.$inferSelect;
 export type InsertComment = typeof comments.$inferInsert;
+
+// ---- Developer Hub Settings ----
+export const developerHubSettings = mysqlTable("developer_hub_settings", {
+  id: int("id").autoincrement().primaryKey(),
+  repoPath: varchar("repoPath", { length: 512 }),
+  githubRepo: varchar("githubRepo", { length: 255 }),
+  githubTokenEncrypted: text("githubTokenEncrypted"),
+  defaultBranch: varchar("defaultBranch", { length: 100 }).default("main").notNull(),
+  isEnabled: boolean("isEnabled").default(true).notNull(),
+  lastPushAt: timestamp("lastPushAt"),
+  createdAt: timestamp("createdAt").defaultNow().notNull(),
+  updatedAt: timestamp("updatedAt").defaultNow().onUpdateNow().notNull(),
+});
+
+export type DeveloperHubSettings = typeof developerHubSettings.$inferSelect;
+export type InsertDeveloperHubSettings = typeof developerHubSettings.$inferInsert;

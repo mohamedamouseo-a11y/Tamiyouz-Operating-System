@@ -9,6 +9,8 @@ import { TRPCError } from "@trpc/server";
 import { z } from "zod";
 import {
   getAllDepartments, getDepartmentById, createDepartment, updateDepartment, deleteDepartment,
+  getWorkspacesByDepartment, getAllDepartmentWorkspaces, getWorkspaceById,
+  createDepartmentWorkspace, updateDepartmentWorkspace, deleteDepartmentWorkspace,
   getAllEmployees, getEmployeeById, getEmployeesByDepartment, getEmployeeByUserId,
   createEmployee, updateEmployee, deleteEmployee, linkEmployeeToUser,
   getAllClients, getClientById, createClient, updateClient, deleteClient,
@@ -20,12 +22,26 @@ import {
   saveChatMessage, getChatHistory,
   getAllUsers, updateUserRole, linkUserToEmployee, getUserByEmail,
   createComment, getAllComments, updateCommentStatus, getAllActivityLogs,
+  getDb,
 } from "./db";
 import { getTrelloService, syncEmployeeBoard } from "./trello";
 import { generateDailyReport as aiGenerateDailyReport, analyzePerformance, checkDeadlines } from "./ai-agent";
 import { invokeLLM } from "./_core/llm";
 import type { User } from "../drizzle/schema";
+import {
+  clients,
+  clientServices,
+  clientIntegrations,
+  clientAssignments,
+  clientNotes,
+  clientKpis,
+  employees,
+  departments,
+  users,
+} from "../drizzle/schema";
+import { and, desc, eq, gte, inArray, like, lte, or } from "drizzle-orm";
 import { answerHelpQuestion } from "./helpCenterAI";
+import { getDeveloperHubStatus, saveDeveloperHubConfig } from "./developerHub";
 import {
   addFeedback as addHelpFeedback,
   createArticle as createHelpArticle,
@@ -85,6 +101,137 @@ async function getVisibleEmployeeIds(user: User): Promise<number[] | 'all'> {
   return [employee.id];
 }
 
+async function validateEmployeeWorkspaceLink(input: {
+  departmentId?: number;
+  departmentWorkspaceId?: number | null;
+  existingEmployeeId?: number;
+}) {
+  let effectiveDepartmentId = input.departmentId;
+  let effectiveWorkspaceId = input.departmentWorkspaceId;
+
+  if (input.existingEmployeeId !== undefined && (effectiveDepartmentId === undefined || effectiveWorkspaceId === undefined)) {
+    const existingEmployee = await getEmployeeById(input.existingEmployeeId);
+    if (!existingEmployee) {
+      throw new TRPCError({ code: 'NOT_FOUND', message: 'Employee not found.' });
+    }
+    if (effectiveDepartmentId === undefined) effectiveDepartmentId = existingEmployee.departmentId;
+    if (effectiveWorkspaceId === undefined) effectiveWorkspaceId = existingEmployee.departmentWorkspaceId ?? null;
+  }
+
+  if (effectiveWorkspaceId == null) return;
+
+  if (effectiveDepartmentId == null) {
+    throw new TRPCError({
+      code: 'BAD_REQUEST',
+      message: 'Department is required when assigning a department workspace.',
+    });
+  }
+
+  const workspace = await getWorkspaceById(effectiveWorkspaceId);
+  if (!workspace) {
+    throw new TRPCError({ code: 'BAD_REQUEST', message: 'Selected workspace does not exist.' });
+  }
+
+  if (workspace.departmentId == null || workspace.departmentId !== effectiveDepartmentId) {
+    throw new TRPCError({
+      code: 'BAD_REQUEST',
+      message: 'Selected workspace does not belong to the selected department.',
+    });
+  }
+}
+
+// =============================================
+// Client Area RBAC Helpers
+// =============================================
+
+async function getCurrentEmployee(userId: number) {
+  const db = await getDb();
+  const rows = await db
+    .select()
+    .from(employees)
+    .where(eq(employees.userId, userId))
+    .limit(1);
+  return rows[0] ?? null;
+}
+
+async function getVisibleClientIds(user: User): Promise<number[] | null> {
+  const roleLevel = getRoleLevel(user.role);
+  if (roleLevel >= 4) return null; // CMO+ sees all
+
+  const currentEmployee = await getCurrentEmployee(user.id);
+  if (!currentEmployee) return [];
+
+  const db = await getDb();
+
+  if (roleLevel === 1) {
+    // employee: only assigned clients
+    const rows = await db
+      .select({ clientId: clientAssignments.clientId })
+      .from(clientAssignments)
+      .where(eq(clientAssignments.employeeId, currentEmployee.id));
+    return [...new Set(rows.map((r: { clientId: number }) => r.clientId))];
+  }
+
+  // team_leader / director: department + own employees' assignments
+  const deptEmployees = await getEmployeesByDepartment(currentEmployee.departmentId);
+  const empIds = deptEmployees.map(e => e.id);
+
+  const rows = await db
+    .select({ clientId: clientAssignments.clientId })
+    .from(clientAssignments)
+    .where(
+      or(
+        eq(clientAssignments.departmentId, currentEmployee.departmentId),
+        empIds.length ? inArray(clientAssignments.employeeId, empIds) : undefined,
+      ),
+    );
+  return [...new Set(rows.map((r: { clientId: number }) => r.clientId))];
+}
+
+async function canAccessClient(user: User, clientId: number) {
+  const visibleIds = await getVisibleClientIds(user);
+  if (visibleIds === null) return true;
+  return visibleIds.includes(clientId);
+}
+
+async function assertClientVisible(user: User, clientId: number) {
+  const allowed = await canAccessClient(user, clientId);
+  if (!allowed) {
+    throw new TRPCError({ code: "FORBIDDEN", message: "You do not have access to this client." });
+  }
+}
+
+async function assertTeamLeaderScope(
+  user: User,
+  input: { employeeId?: number | null; departmentId?: number | null },
+) {
+  const roleLevel = getRoleLevel(user.role);
+  if (roleLevel >= 4) return;
+
+  const currentEmployee = await getCurrentEmployee(user.id);
+  if (!currentEmployee) {
+    throw new TRPCError({ code: "FORBIDDEN", message: "No linked employee profile found." });
+  }
+
+  if (input.departmentId && input.departmentId !== currentEmployee.departmentId) {
+    throw new TRPCError({ code: "FORBIDDEN", message: "You can only manage your own department." });
+  }
+
+  if (input.employeeId) {
+    const db = await getDb();
+    const rows = await db
+      .select()
+      .from(employees)
+      .where(eq(employees.id, input.employeeId))
+      .limit(1);
+    const employee = rows[0];
+    if (!employee || employee.departmentId !== currentEmployee.departmentId) {
+      throw new TRPCError({ code: "FORBIDDEN", message: "Target employee must belong to your department." });
+    }
+  }
+}
+
+// =============================================
 
 const helpArticleSchema = z.object({
   title: z.string().min(1).max(255),
@@ -113,6 +260,28 @@ async function enrichHelpArticle(article: Awaited<ReturnType<typeof getAllHelpAr
     helpfulPercentage: totalVotes > 0 ? Math.round((feedback.helpful / totalVotes) * 100) : 0,
   };
 }
+
+// =============================================
+// Client Area Input Schemas
+// =============================================
+
+const clientListInputSchema = z
+  .object({
+    search: z.string().trim().optional(),
+    industry: z.string().trim().optional(),
+    status: z.enum(["active", "inactive"]).optional(),
+  })
+  .optional();
+
+const clientBaseSchema = z.object({
+  name: z.string().trim().min(1).max(191),
+  nameAr: z.string().trim().max(191).optional().nullable(),
+  contactEmail: z.string().trim().email().optional().nullable(),
+  contactPhone: z.string().trim().max(50).optional().nullable(),
+  industry: z.string().trim().min(1).max(120),
+  isActive: z.boolean().default(true),
+  services: z.array(z.string().trim().min(1).max(100)).default([]),
+});
 
 export const appRouter = router({
   system: systemRouter,
@@ -186,49 +355,621 @@ export const appRouter = router({
       .input(z.object({
         name: z.string().min(1), nameAr: z.string().optional(), email: z.string().email().optional(),
         phone: z.string().optional(), departmentId: z.number(), position: z.string().optional(),
+        departmentWorkspaceId: z.number().nullable().optional(),
         trelloBoardId: z.string().optional(), trelloBoardUrl: z.string().optional(),
       }))
-      .mutation(({ input }) => createEmployee(input)),
+      .mutation(async ({ input }) => {
+        await validateEmployeeWorkspaceLink({
+          departmentId: input.departmentId,
+          departmentWorkspaceId: input.departmentWorkspaceId ?? null,
+        });
+        const linkedUser = input.email ? await getUserByEmail(input.email) : undefined;
+        return createEmployee({
+          ...input,
+          departmentWorkspaceId: input.departmentWorkspaceId ?? null,
+          userId: linkedUser?.id ?? null,
+        });
+      }),
     update: superAdminProcedure
       .input(z.object({
         id: z.number(), name: z.string().min(1).optional(), nameAr: z.string().optional(),
         email: z.string().email().optional(), phone: z.string().optional(),
         departmentId: z.number().optional(), position: z.string().optional(),
+        departmentWorkspaceId: z.number().nullable().optional(),
         trelloBoardId: z.string().optional(), trelloBoardUrl: z.string().optional(),
         isActive: z.boolean().optional(),
       }))
-      .mutation(({ input }) => updateEmployee(input.id, input)),
+      .mutation(async ({ input }) => {
+        await validateEmployeeWorkspaceLink({
+          existingEmployeeId: input.id,
+          departmentId: input.departmentId,
+          departmentWorkspaceId: input.departmentWorkspaceId,
+        });
+        const linkedUser = input.email ? await getUserByEmail(input.email) : undefined;
+        const payload: Record<string, unknown> = { ...input };
+        if (input.departmentWorkspaceId !== undefined) payload.departmentWorkspaceId = input.departmentWorkspaceId ?? null;
+        if (linkedUser?.id) payload.userId = linkedUser.id;
+        return updateEmployee(input.id, payload);
+      }),
     delete: superAdminProcedure
       .input(z.object({ id: z.number() }))
-      .mutation(({ input }) => deleteEmployee(input.id)),
+      .mutation(async ({ ctx, input }) => {
+        const target = await getEmployeeById(input.id);
+        if (!target) throw new TRPCError({ code: 'NOT_FOUND', message: 'Employee not found.' });
+        const current = await getEmployeeByUserId(ctx.user.id);
+        if (current?.id === target.id) {
+          throw new TRPCError({ code: 'BAD_REQUEST', message: 'You cannot delete your own linked employee profile.' });
+        }
+        return deleteEmployee(input.id);
+      }),
     linkToUser: superAdminProcedure
       .input(z.object({ employeeId: z.number(), userId: z.number() }))
       .mutation(({ input }) => linkEmployeeToUser(input.employeeId, input.userId)),
   }),
 
-  // ---- Clients ----
-  clients: router({
-    list: protectedProcedure.query(() => getAllClients()),
-    getById: protectedProcedure
+  // ---- Department Workspaces ----
+  departmentWorkspaces: router({
+    listAll: superAdminProcedure.query(() => getAllDepartmentWorkspaces()),
+    listByDepartment: superAdminProcedure
+      .input(z.object({ departmentId: z.number() }))
+      .query(({ input }) => getWorkspacesByDepartment(input.departmentId)),
+    create: superAdminProcedure
+      .input(
+        z.object({
+          departmentId: z.number().nullable().optional(),
+          name: z.string().trim().min(1),
+          trelloWorkspaceId: z.string().trim().optional(),
+          apiKey: z.string().trim().min(1),
+          apiToken: z.string().trim().min(1),
+          isActive: z.boolean().optional(),
+        }),
+      )
+      .mutation(({ input }) =>
+        createDepartmentWorkspace({
+          departmentId: input.departmentId ?? null,
+          name: input.name,
+          trelloWorkspaceId: input.trelloWorkspaceId || null,
+          apiKey: input.apiKey,
+          apiToken: input.apiToken,
+          isActive: input.isActive ?? true,
+        }),
+      ),
+    update: superAdminProcedure
+      .input(
+        z.object({
+          id: z.number(),
+          data: z.object({
+            departmentId: z.number().nullable().optional(),
+            name: z.string().trim().min(1).optional(),
+            trelloWorkspaceId: z.string().trim().optional(),
+            apiKey: z.string().trim().optional(),
+            apiToken: z.string().trim().optional(),
+            isActive: z.boolean().optional(),
+          }),
+        }),
+      )
+      .mutation(({ input }) =>
+        updateDepartmentWorkspace(input.id, {
+          ...input.data,
+          departmentId: input.data.departmentId === undefined ? undefined : input.data.departmentId ?? null,
+          trelloWorkspaceId:
+            input.data.trelloWorkspaceId === undefined ? undefined : input.data.trelloWorkspaceId || null,
+        }),
+      ),
+    delete: superAdminProcedure
       .input(z.object({ id: z.number() }))
-      .query(({ input }) => getClientById(input.id)),
-    create: teamLeaderProcedure
-      .input(z.object({
-        name: z.string().min(1), nameAr: z.string().optional(),
-        contactEmail: z.string().email().optional(), contactPhone: z.string().optional(),
-        industry: z.string().optional(),
-      }))
-      .mutation(({ input }) => createClient(input)),
+      .mutation(({ input }) => deleteDepartmentWorkspace(input.id)),
+    testConnection: superAdminProcedure
+      .input(z.object({ id: z.number() }))
+      .mutation(async ({ input }) => {
+        const workspace = await getWorkspaceById(input.id);
+        if (!workspace) throw new TRPCError({ code: 'NOT_FOUND', message: 'Workspace not found.' });
+        const svc = await getTrelloService(workspace.apiKey, workspace.apiToken);
+        return svc.testConnection();
+      }),
+    getOrganizations: superAdminProcedure
+      .input(z.object({ id: z.number() }))
+      .mutation(async ({ input }) => {
+        const workspace = await getWorkspaceById(input.id);
+        if (!workspace) throw new TRPCError({ code: 'NOT_FOUND', message: 'Workspace not found.' });
+        const svc = await getTrelloService(workspace.apiKey, workspace.apiToken);
+        return svc.getOrganizations();
+      }),
+    autoLinkWorkspaceId: superAdminProcedure
+      .input(z.object({ id: z.number() }))
+      .mutation(async ({ input }) => {
+        const workspace = await getWorkspaceById(input.id);
+        if (!workspace) throw new TRPCError({ code: 'NOT_FOUND', message: 'Workspace not found.' });
+        const svc = await getTrelloService(workspace.apiKey, workspace.apiToken);
+        const orgs = await svc.getOrganizations();
+        const match = orgs.find((o: { displayName: string }) => o.displayName === workspace.name);
+        if (!match) throw new TRPCError({ code: 'NOT_FOUND', message: `No matching Trello organization found for: ${workspace.name}` });
+        await updateDepartmentWorkspace(input.id, { trelloWorkspaceId: match.id });
+        return { organizationId: match.id, organizationName: match.displayName };
+      }),
+    getBoards: superAdminProcedure
+      .input(z.object({ id: z.number() }))
+      .mutation(async ({ input }) => {
+        const workspace = await getWorkspaceById(input.id);
+        if (!workspace) throw new TRPCError({ code: 'NOT_FOUND', message: 'Workspace not found.' });
+        const svc = await getTrelloService(workspace.apiKey, workspace.apiToken);
+        return svc.getBoards(workspace.trelloWorkspaceId || undefined);
+      }),
+  }),
+
+  // ---- Clients (UPDATED with RBAC + search/filter + services) ----
+  clients: router({
+    list: protectedProcedure.input(clientListInputSchema).query(async ({ ctx, input }) => {
+      const db = await getDb();
+      const visibleClientIds = await getVisibleClientIds(ctx.user);
+      if (visibleClientIds && visibleClientIds.length === 0) return [];
+
+      const whereParts: any[] = [];
+      if (visibleClientIds !== null) whereParts.push(inArray(clients.id, visibleClientIds));
+      if (input?.search) {
+        whereParts.push(
+          or(
+            like(clients.name, `%${input.search}%`),
+            like(clients.nameAr, `%${input.search}%`),
+            like(clients.contactEmail, `%${input.search}%`),
+          ),
+        );
+      }
+      if (input?.industry) whereParts.push(eq(clients.industry, input.industry));
+      if (input?.status) whereParts.push(eq(clients.isActive, input.status === "active"));
+
+      const rows = await db
+        .select({
+          id: clients.id,
+          name: clients.name,
+          nameAr: clients.nameAr,
+          contactEmail: clients.contactEmail,
+          contactPhone: clients.contactPhone,
+          industry: clients.industry,
+          isActive: clients.isActive,
+          service: clientServices.service,
+        })
+        .from(clients)
+        .leftJoin(clientServices, eq(clientServices.clientId, clients.id))
+        .where(whereParts.length ? and(...whereParts) : undefined)
+        .orderBy(desc(clients.id));
+
+      const byClient = new Map<number, any>();
+      for (const row of rows) {
+        if (!byClient.has(row.id)) {
+          byClient.set(row.id, {
+            id: row.id,
+            name: row.name,
+            nameAr: row.nameAr,
+            contactEmail: row.contactEmail,
+            contactPhone: row.contactPhone,
+            industry: row.industry,
+            isActive: row.isActive,
+            services: [],
+          });
+        }
+        if (row.service) byClient.get(row.id).services.push(row.service);
+      }
+
+      return Array.from(byClient.values());
+    }),
+
+    getById: protectedProcedure
+      .input(z.object({ id: z.coerce.number().int().positive() }))
+      .query(async ({ ctx, input }) => {
+        await assertClientVisible(ctx.user, input.id);
+        const db = await getDb();
+
+        const base = await db.select().from(clients).where(eq(clients.id, input.id)).limit(1);
+        if (!base[0]) {
+          throw new TRPCError({ code: "NOT_FOUND", message: "Client not found." });
+        }
+
+        const services = await db
+          .select({ service: clientServices.service })
+          .from(clientServices)
+          .where(eq(clientServices.clientId, input.id));
+
+        return {
+          ...base[0],
+          services: services.map((item: { service: string }) => item.service),
+        };
+      }),
+
+    create: teamLeaderProcedure.input(clientBaseSchema).mutation(async ({ ctx, input }) => {
+      const db = await getDb();
+      const result = await db.insert(clients).values({
+        name: input.name,
+        nameAr: input.nameAr ?? null,
+        contactEmail: input.contactEmail ?? null,
+        contactPhone: input.contactPhone ?? null,
+        industry: input.industry,
+        isActive: input.isActive,
+      });
+
+      const clientId = Number((result as any)[0].insertId);
+
+      if (input.services.length) {
+        await db.insert(clientServices).values(
+          input.services.map((service) => ({
+            clientId,
+            service,
+          })),
+        );
+      }
+
+      const created = await db.select().from(clients).where(eq(clients.id, clientId)).limit(1);
+      return created[0];
+    }),
+
     update: teamLeaderProcedure
-      .input(z.object({
-        id: z.number(), name: z.string().min(1).optional(), nameAr: z.string().optional(),
-        contactEmail: z.string().email().optional(), contactPhone: z.string().optional(),
-        industry: z.string().optional(), isActive: z.boolean().optional(),
-      }))
-      .mutation(({ input }) => updateClient(input.id, input)),
+      .input(clientBaseSchema.extend({ id: z.coerce.number().int().positive() }))
+      .mutation(async ({ ctx, input }) => {
+        await assertClientVisible(ctx.user, input.id);
+        const db = await getDb();
+
+        await db
+          .update(clients)
+          .set({
+            name: input.name,
+            nameAr: input.nameAr ?? null,
+            contactEmail: input.contactEmail ?? null,
+            contactPhone: input.contactPhone ?? null,
+            industry: input.industry,
+            isActive: input.isActive,
+          })
+          .where(eq(clients.id, input.id));
+
+        await db.delete(clientServices).where(eq(clientServices.clientId, input.id));
+        if (input.services.length) {
+          await db.insert(clientServices).values(
+            input.services.map((service) => ({
+              clientId: input.id,
+              service,
+            })),
+          );
+        }
+
+        const updated = await db.select().from(clients).where(eq(clients.id, input.id)).limit(1);
+        return updated[0];
+      }),
+
     delete: superAdminProcedure
       .input(z.object({ id: z.number() }))
       .mutation(({ input }) => deleteClient(input.id)),
+  }),
+
+  // ---- Client Integrations (NEW) ----
+  clientIntegrations: router({
+    list: protectedProcedure
+      .input(z.object({ clientId: z.coerce.number().int().positive(), service: z.string().trim().optional() }))
+      .query(async ({ ctx, input }) => {
+        await assertClientVisible(ctx.user, input.clientId);
+        const db = await getDb();
+        const whereParts = [eq(clientIntegrations.clientId, input.clientId)];
+        if (input.service) whereParts.push(eq(clientIntegrations.service, input.service));
+        return db.select().from(clientIntegrations).where(and(...whereParts)).orderBy(desc(clientIntegrations.updatedAt));
+      }),
+
+    upsert: protectedProcedure
+      .input(
+        z.object({
+          id: z.coerce.number().int().positive().optional(),
+          clientId: z.coerce.number().int().positive(),
+          service: z.string().trim().min(1).max(100),
+          integrationType: z.string().trim().min(1).max(100),
+          displayName: z.string().trim().min(1).max(191),
+          externalId: z.string().trim().max(191).optional().nullable(),
+          status: z.string().trim().min(1).max(50).default("active"),
+          metadata: z.record(z.any()).optional().nullable(),
+        }),
+      )
+      .mutation(async ({ ctx, input }) => {
+        await assertClientVisible(ctx.user, input.clientId);
+        const db = await getDb();
+
+        const payload = {
+          clientId: input.clientId,
+          service: input.service,
+          integrationType: input.integrationType,
+          displayName: input.displayName,
+          externalId: input.externalId ?? null,
+          status: input.status,
+          metadata: input.metadata ?? null,
+        };
+
+        if (input.id) {
+          await db.update(clientIntegrations).set(payload).where(eq(clientIntegrations.id, input.id));
+          const updated = await db.select().from(clientIntegrations).where(eq(clientIntegrations.id, input.id)).limit(1);
+          return updated[0];
+        }
+
+        const result = await db.insert(clientIntegrations).values(payload);
+        const id = Number((result as any)[0].insertId);
+        const created = await db.select().from(clientIntegrations).where(eq(clientIntegrations.id, id)).limit(1);
+        return created[0];
+      }),
+
+    delete: protectedProcedure
+      .input(z.object({ id: z.coerce.number().int().positive() }))
+      .mutation(async ({ ctx, input }) => {
+        const db = await getDb();
+        const rows = await db.select().from(clientIntegrations).where(eq(clientIntegrations.id, input.id)).limit(1);
+        const integration = rows[0];
+        if (!integration) throw new TRPCError({ code: "NOT_FOUND", message: "Integration not found." });
+        await assertClientVisible(ctx.user, integration.clientId);
+        await db.delete(clientIntegrations).where(eq(clientIntegrations.id, input.id));
+        return { success: true };
+      }),
+  }),
+
+  // ---- Client Assignments (NEW) ----
+  clientAssignments: router({
+    list: protectedProcedure
+      .input(z.object({ clientId: z.coerce.number().int().positive() }))
+      .query(async ({ ctx, input }) => {
+        await assertClientVisible(ctx.user, input.clientId);
+        const db = await getDb();
+        return db
+          .select({
+            id: clientAssignments.id,
+            clientId: clientAssignments.clientId,
+            employeeId: clientAssignments.employeeId,
+            departmentId: clientAssignments.departmentId,
+            employeeName: employees.name,
+            departmentName: departments.name,
+          })
+          .from(clientAssignments)
+          .leftJoin(employees, eq(employees.id, clientAssignments.employeeId))
+          .leftJoin(departments, eq(departments.id, clientAssignments.departmentId))
+          .where(eq(clientAssignments.clientId, input.clientId))
+          .orderBy(clientAssignments.id);
+      }),
+    listByEmployee: protectedProcedure
+      .input(z.object({ employeeId: z.coerce.number().int().positive() }))
+      .query(async ({ ctx, input }) => {
+        const visible = await getVisibleEmployeeIds(ctx.user);
+        if (visible !== 'all' && !visible.includes(input.employeeId)) throw new TRPCError({ code: 'FORBIDDEN' });
+        const db = await getDb();
+        return db
+          .select({
+            id: clientAssignments.id,
+            clientId: clientAssignments.clientId,
+            employeeId: clientAssignments.employeeId,
+            departmentId: clientAssignments.departmentId,
+            clientName: clients.name,
+            clientIndustry: clients.industry,
+            clientIsActive: clients.isActive,
+            employeeName: employees.name,
+            departmentName: departments.name,
+          })
+          .from(clientAssignments)
+          .leftJoin(clients, eq(clients.id, clientAssignments.clientId))
+          .leftJoin(employees, eq(employees.id, clientAssignments.employeeId))
+          .leftJoin(departments, eq(departments.id, clientAssignments.departmentId))
+          .where(eq(clientAssignments.employeeId, input.employeeId))
+          .orderBy(clients.name, clientAssignments.id);
+      }),
+
+    assign: teamLeaderProcedure
+      .input(
+        z
+          .object({
+            clientId: z.coerce.number().int().positive(),
+            employeeId: z.coerce.number().int().positive().optional(),
+            departmentId: z.coerce.number().int().positive().optional(),
+          })
+          .refine((val) => !!val.employeeId || !!val.departmentId, {
+            message: "employeeId or departmentId is required",
+          }),
+      )
+      .mutation(async ({ ctx, input }) => {
+        await assertClientVisible(ctx.user, input.clientId);
+        await assertTeamLeaderScope(ctx.user, input);
+        const db = await getDb();
+
+        const duplicate = await db
+          .select()
+          .from(clientAssignments)
+          .where(
+            and(
+              eq(clientAssignments.clientId, input.clientId),
+              input.employeeId
+                ? eq(clientAssignments.employeeId, input.employeeId)
+                : eq(clientAssignments.departmentId, input.departmentId!),
+            ),
+          )
+          .limit(1);
+
+        if (duplicate[0]) return duplicate[0];
+
+        const result = await db.insert(clientAssignments).values({
+          clientId: input.clientId,
+          employeeId: input.employeeId ?? null,
+          departmentId: input.departmentId ?? null,
+        });
+
+        const id = Number((result as any)[0].insertId);
+        const created = await db.select().from(clientAssignments).where(eq(clientAssignments.id, id)).limit(1);
+        return created[0];
+      }),
+
+    unassign: teamLeaderProcedure
+      .input(z.object({ id: z.coerce.number().int().positive() }))
+      .mutation(async ({ ctx, input }) => {
+        const db = await getDb();
+        const rows = await db.select().from(clientAssignments).where(eq(clientAssignments.id, input.id)).limit(1);
+        const assignment = rows[0];
+        if (!assignment) throw new TRPCError({ code: "NOT_FOUND", message: "Assignment not found." });
+        await assertClientVisible(ctx.user, assignment.clientId);
+        await db.delete(clientAssignments).where(eq(clientAssignments.id, input.id));
+        return { success: true };
+      }),
+  }),
+
+  // ---- Client Notes (NEW) ----
+  clientNotes: router({
+    list: protectedProcedure
+      .input(z.object({ clientId: z.coerce.number().int().positive() }))
+      .query(async ({ ctx, input }) => {
+        await assertClientVisible(ctx.user, input.clientId);
+        const db = await getDb();
+        return db
+          .select({
+            id: clientNotes.id,
+            clientId: clientNotes.clientId,
+            authorId: clientNotes.authorId,
+            content: clientNotes.content,
+            createdAt: clientNotes.createdAt,
+            authorName: users.name,
+          })
+          .from(clientNotes)
+          .leftJoin(users, eq(users.id, clientNotes.authorId))
+          .where(eq(clientNotes.clientId, input.clientId))
+          .orderBy(desc(clientNotes.createdAt));
+      }),
+
+    create: protectedProcedure
+      .input(z.object({ clientId: z.coerce.number().int().positive(), content: z.string().trim().min(1).max(5000) }))
+      .mutation(async ({ ctx, input }) => {
+        await assertClientVisible(ctx.user, input.clientId);
+        const db = await getDb();
+        const result = await db.insert(clientNotes).values({
+          clientId: input.clientId,
+          authorId: ctx.user.id,
+          content: input.content,
+        });
+        const id = Number((result as any)[0].insertId);
+        const created = await db.select().from(clientNotes).where(eq(clientNotes.id, id)).limit(1);
+        return created[0];
+      }),
+
+    update: protectedProcedure
+      .input(z.object({ id: z.coerce.number().int().positive(), content: z.string().trim().min(1).max(5000) }))
+      .mutation(async ({ ctx, input }) => {
+        const db = await getDb();
+        const rows = await db.select().from(clientNotes).where(eq(clientNotes.id, input.id)).limit(1);
+        const note = rows[0];
+        if (!note) throw new TRPCError({ code: "NOT_FOUND", message: "Note not found." });
+        await assertClientVisible(ctx.user, note.clientId);
+        const canEdit = note.authorId === ctx.user.id || getRoleLevel(ctx.user.role) >= 2;
+        if (!canEdit) throw new TRPCError({ code: "FORBIDDEN", message: "Not allowed." });
+        await db.update(clientNotes).set({ content: input.content }).where(eq(clientNotes.id, input.id));
+        const updated = await db.select().from(clientNotes).where(eq(clientNotes.id, input.id)).limit(1);
+        return updated[0];
+      }),
+
+    delete: protectedProcedure
+      .input(z.object({ id: z.coerce.number().int().positive() }))
+      .mutation(async ({ ctx, input }) => {
+        const db = await getDb();
+        const rows = await db.select().from(clientNotes).where(eq(clientNotes.id, input.id)).limit(1);
+        const note = rows[0];
+        if (!note) throw new TRPCError({ code: "NOT_FOUND", message: "Note not found." });
+        await assertClientVisible(ctx.user, note.clientId);
+        const canDelete = note.authorId === ctx.user.id || getRoleLevel(ctx.user.role) >= 2;
+        if (!canDelete) throw new TRPCError({ code: "FORBIDDEN", message: "Not allowed." });
+        await db.delete(clientNotes).where(eq(clientNotes.id, input.id));
+        return { success: true };
+      }),
+  }),
+
+  // ---- Client KPIs (NEW) ----
+  clientKpis: router({
+    list: protectedProcedure
+      .input(
+        z.object({
+          clientId: z.coerce.number().int().positive(),
+          metricName: z.string().trim().optional(),
+          from: z.string().optional(),
+          to: z.string().optional(),
+        }),
+      )
+      .query(async ({ ctx, input }) => {
+        await assertClientVisible(ctx.user, input.clientId);
+        const db = await getDb();
+        const whereParts = [eq(clientKpis.clientId, input.clientId)];
+        if (input.metricName) whereParts.push(eq(clientKpis.metricName, input.metricName));
+        if (input.from) whereParts.push(gte(clientKpis.date, input.from));
+        if (input.to) whereParts.push(lte(clientKpis.date, input.to));
+        return db
+          .select({
+            id: clientKpis.id,
+            clientId: clientKpis.clientId,
+            metricName: clientKpis.metricName,
+            metricValue: clientKpis.metricValue,
+            date: clientKpis.date,
+            recordedById: clientKpis.recordedById,
+            recordedByName: users.name,
+          })
+          .from(clientKpis)
+          .leftJoin(users, eq(users.id, clientKpis.recordedById))
+          .where(and(...whereParts))
+          .orderBy(desc(clientKpis.date), desc(clientKpis.id));
+      }),
+
+    create: protectedProcedure
+      .input(
+        z.object({
+          clientId: z.coerce.number().int().positive(),
+          metricName: z.string().trim().min(1).max(120),
+          metricValue: z.coerce.number(),
+          date: z.string().regex(/^\d{4}-\d{2}-\d{2}$/),
+        }),
+      )
+      .mutation(async ({ ctx, input }) => {
+        await assertClientVisible(ctx.user, input.clientId);
+        const db = await getDb();
+        const result = await db.insert(clientKpis).values({
+          clientId: input.clientId,
+          metricName: input.metricName,
+          metricValue: input.metricValue,
+          date: input.date,
+          recordedById: ctx.user.id,
+        });
+        const id = Number((result as any)[0].insertId);
+        const created = await db.select().from(clientKpis).where(eq(clientKpis.id, id)).limit(1);
+        return created[0];
+      }),
+
+    update: protectedProcedure
+      .input(
+        z.object({
+          id: z.coerce.number().int().positive(),
+          metricName: z.string().trim().min(1).max(120),
+          metricValue: z.coerce.number(),
+          date: z.string().regex(/^\d{4}-\d{2}-\d{2}$/),
+        }),
+      )
+      .mutation(async ({ ctx, input }) => {
+        const db = await getDb();
+        const rows = await db.select().from(clientKpis).where(eq(clientKpis.id, input.id)).limit(1);
+        const kpi = rows[0];
+        if (!kpi) throw new TRPCError({ code: "NOT_FOUND", message: "KPI not found." });
+        await assertClientVisible(ctx.user, kpi.clientId);
+        await db
+          .update(clientKpis)
+          .set({
+            metricName: input.metricName,
+            metricValue: input.metricValue,
+            date: input.date,
+          })
+          .where(eq(clientKpis.id, input.id));
+        const updated = await db.select().from(clientKpis).where(eq(clientKpis.id, input.id)).limit(1);
+        return updated[0];
+      }),
+
+    delete: protectedProcedure
+      .input(z.object({ id: z.coerce.number().int().positive() }))
+      .mutation(async ({ ctx, input }) => {
+        const db = await getDb();
+        const rows = await db.select().from(clientKpis).where(eq(clientKpis.id, input.id)).limit(1);
+        const kpi = rows[0];
+        if (!kpi) throw new TRPCError({ code: "NOT_FOUND", message: "KPI not found." });
+        await assertClientVisible(ctx.user, kpi.clientId);
+        await db.delete(clientKpis).where(eq(clientKpis.id, input.id));
+        return { success: true };
+      }),
   }),
 
   // ---- Tasks ----
@@ -402,6 +1143,48 @@ export const appRouter = router({
         const visible = await getVisibleEmployeeIds(ctx.user);
         if (visible !== 'all' && !visible.includes(input.employeeId)) throw new TRPCError({ code: 'FORBIDDEN' });
         return getTaskStats([input.employeeId], input.startDate, input.endDate);
+      }),
+    employeePerformance: protectedProcedure
+      .input(z.object({ employeeId: z.number(), startDate: z.string().optional(), endDate: z.string().optional() }))
+      .query(async ({ ctx, input }) => {
+        const visible = await getVisibleEmployeeIds(ctx.user);
+        if (visible !== 'all' && !visible.includes(input.employeeId)) throw new TRPCError({ code: 'FORBIDDEN' });
+        const stats = await getTaskStats([input.employeeId], input.startDate, input.endDate);
+        const reports = await getDailyReportsByEmployee(input.employeeId, input.startDate, input.endDate);
+        const db = await getDb();
+        const assignments = await db
+          .select({
+            clientId: clientAssignments.clientId,
+            clientName: clients.name,
+          })
+          .from(clientAssignments)
+          .leftJoin(clients, eq(clients.id, clientAssignments.clientId))
+          .where(eq(clientAssignments.employeeId, input.employeeId));
+
+        const approvedReports = reports.filter((report: any) => report.status === 'approved').length;
+        const generatedReports = reports.filter((report: any) => report.status === 'generated').length;
+        const avgReportHours = reports.length
+          ? reports.reduce((sum: number, report: any) => sum + (Number(report.totalHours) || 0), 0) / reports.length
+          : 0;
+        const totalTasks = stats.totalTasks || 0;
+        const doneTasks = Number(stats.tasksByStatus?.done || 0);
+        const activeDays = new Set(reports.map((report: any) => report.date)).size;
+
+        return {
+          ...stats,
+          reportCount: reports.length,
+          approvedReports,
+          generatedReports,
+          approvalRate: reports.length ? Math.round((approvedReports / reports.length) * 100) : 0,
+          avgReportHours,
+          clientCount: new Set(assignments.map((item: any) => item.clientId)).size,
+          activeDays,
+          lastReportDate: reports[0]?.date ?? null,
+          lastReportStatus: reports[0]?.status ?? null,
+          completionRate: totalTasks ? Math.round((doneTasks / totalTasks) * 100) : 0,
+          backlogTasks: totalTasks - doneTasks,
+          tasksByStatus: stats.tasksByStatus,
+        };
       }),
     departmentStats: managementProcedure
       .input(z.object({ departmentId: z.number().optional(), startDate: z.string().optional(), endDate: z.string().optional() }))
@@ -620,6 +1403,20 @@ export const appRouter = router({
     linkEmployee: superAdminProcedure
       .input(z.object({ userId: z.number(), employeeId: z.number() }))
       .mutation(({ input }) => linkUserToEmployee(input.userId, input.employeeId)),
+  }),
+
+  // ---- Developer Hub ----
+  developerHub: router({
+    get: superAdminProcedure.query(() => getDeveloperHubStatus()),
+    save: superAdminProcedure
+      .input(z.object({
+        repoPath: z.string(),
+        githubRepo: z.string(),
+        githubToken: z.string().optional(),
+        defaultBranch: z.string().default("main"),
+        isEnabled: z.boolean().default(true),
+      }))
+      .mutation(({ input }) => saveDeveloperHubConfig(input)),
   }),
 });
 

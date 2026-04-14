@@ -1,7 +1,17 @@
-import { getTrelloSettings, updateLastSync, getEmployeeById, createTask, updateTask, logActivity, getTasksByEmployee } from './db';
+import {
+  getTrelloSettings,
+  updateLastSync,
+  getEmployeeById,
+  createTask,
+  updateTask,
+  logActivity,
+  getTasksByEmployee,
+  getWorkspaceById,
+} from './db';
 import { TRPCError } from '@trpc/server';
 
 interface TrelloBoard {
+  idOrganization?: string;
   id: string;
   name: string;
   url: string;
@@ -25,20 +35,6 @@ interface TrelloCard {
   dateLastActivity: string;
   due: string | null;
   labels: { id: string; name: string; color: string | null }[];
-}
-
-interface TrelloAction {
-  id: string;
-  type: 'createCard' | 'updateCard';
-  date: string;
-  data: {
-    card: { id: string; name: string };
-    board: { id: string; name: string };
-    list?: { id: string; name: string };
-    listBefore?: { id: string; name: string };
-    listAfter?: { id: string; name: string };
-    old?: { idList?: string };
-  };
 }
 
 export class TrelloService {
@@ -80,8 +76,14 @@ export class TrelloService {
     }
   }
 
-  async getBoards(): Promise<TrelloBoard[]> {
-    return this.trelloFetch('/members/me/boards', { fields: 'name,url,closed', filter: 'open' });
+  async getOrganizations(): Promise<{ id: string; name: string; displayName: string }[]> {
+    return this.trelloFetch("/members/me/organizations", { fields: "id,name,displayName" });
+  }
+  async getBoards(organizationId?: string): Promise<TrelloBoard[]> {
+    if (organizationId) {
+      return this.trelloFetch(`/organizations/${organizationId}/boards`, { fields: 'name,url,closed,idOrganization', filter: 'open' });
+    }
+    return this.trelloFetch('/members/me/boards', { fields: 'name,url,closed,idOrganization', filter: 'open' });
   }
 
   async getBoardLists(boardId: string): Promise<TrelloList[]> {
@@ -93,16 +95,13 @@ export class TrelloService {
       fields: 'name,desc,url,idList,dateLastActivity,due,labels',
     });
   }
-
-  async getCardActions(cardId: string): Promise<TrelloAction[]> {
-    return this.trelloFetch(`/cards/${cardId}/actions`, {
-      filter: 'updateCard:idList,createCard',
-      limit: '50',
-    });
-  }
 }
 
-export async function getTrelloService(): Promise<TrelloService> {
+export async function getTrelloService(apiKey?: string, apiToken?: string): Promise<TrelloService> {
+  if (apiKey && apiToken) {
+    return new TrelloService(apiKey, apiToken);
+  }
+
   const settings = await getTrelloSettings();
   if (!settings) {
     throw new TRPCError({ code: 'NOT_FOUND', message: 'Trello settings not configured. Please configure in Settings.' });
@@ -110,7 +109,16 @@ export async function getTrelloService(): Promise<TrelloService> {
   return new TrelloService(settings.apiKey, settings.apiToken);
 }
 
-// Map Trello list names to TOS task statuses
+async function getTrelloServiceForEmployee(employee: { departmentWorkspaceId?: number | null }) {
+  if (employee.departmentWorkspaceId) {
+    const workspace = await getWorkspaceById(employee.departmentWorkspaceId);
+    if (workspace?.isActive) {
+      return new TrelloService(workspace.apiKey, workspace.apiToken);
+    }
+  }
+  return getTrelloService();
+}
+
 function mapListToStatus(listName: string): 'todo' | 'in_progress' | 'review' | 'done' {
   const lower = listName.toLowerCase();
   if (lower.includes('done') || lower.includes('complete') || lower.includes('finished')) return 'done';
@@ -125,7 +133,7 @@ export async function syncEmployeeBoard(employeeId: number): Promise<{ synced: n
     throw new TRPCError({ code: 'NOT_FOUND', message: `Employee ${employeeId} has no Trello board configured.` });
   }
 
-  const trelloService = await getTrelloService();
+  const trelloService = await getTrelloServiceForEmployee(employee);
   const boardId = employee.trelloBoardId;
 
   const lists = await trelloService.getBoardLists(boardId);
@@ -133,21 +141,19 @@ export async function syncEmployeeBoard(employeeId: number): Promise<{ synced: n
 
   const listStatusMap: Record<string, 'todo' | 'in_progress' | 'review' | 'done'> = {};
   const listNameMap: Record<string, string> = {};
-  lists.forEach(list => {
+  lists.forEach((list) => {
     listStatusMap[list.id] = mapListToStatus(list.name);
     listNameMap[list.id] = list.name;
   });
 
   let created = 0;
   let updated = 0;
+  const existingTasks = await getTasksByEmployee(employeeId);
 
   for (const card of cards) {
     const currentStatus = listStatusMap[card.idList] || 'todo';
     const today = new Date().toISOString().split('T')[0];
-
-    // Check if task already exists by trelloCardId
-    const existingTasks = await getTasksByEmployee(employeeId);
-    const existingTask = existingTasks.find(t => t.trelloCardId === card.id);
+    const existingTask = existingTasks.find((task) => task.trelloCardId === card.id);
 
     if (existingTask) {
       const oldStatus = existingTask.status;

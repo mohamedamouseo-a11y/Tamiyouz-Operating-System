@@ -9,12 +9,13 @@ import Home from "./pages/Home";
 import EmployeesPage from "./pages/EmployeesPage";
 import EmployeeDetailPage from "./pages/EmployeeDetailPage";
 import ClientsPage from "./pages/ClientsPage";
+import ClientDetailPage from "./pages/ClientDetailPage";
 import DepartmentsPage from "./pages/DepartmentsPage";
 import DailyReportsPage from "./pages/DailyReportsPage";
 import AnalyticsPage from "./pages/AnalyticsPage";
 import MyTasksPage from "./pages/MyTasksPage";
 import MyReportsPage from "./pages/MyReportsPage";
-import TrelloSettingsPage from "./pages/TrelloSettingsPage";
+import DepartmentWorkspacesPage from "./pages/DepartmentWorkspacesPage";
 import UserManagementPage from "./pages/UserManagementPage";
 import AlertsPage from "./pages/AlertsPage";
 import HelpCenterPage from "./pages/HelpCenterPage";
@@ -22,12 +23,12 @@ import HelpArticlePage from "./pages/HelpArticlePage";
 import HelpAdminPage from "./pages/HelpAdminPage";
 import CommentsPage from "./pages/CommentsPage";
 import ActivityLogPage from "./pages/ActivityLogPage";
+import TrelloSettingsPage from "./pages/TrelloSettingsPage";
+import DeveloperHubSettingsPage from "./pages/DeveloperHubSettingsPage";
 import { useAuth } from "./_core/hooks/useAuth";
-
 
 function Router() {
   const { user } = useAuth();
-
   return (
     <DashboardLayout>
       <Switch>
@@ -35,13 +36,18 @@ function Router() {
         <Route path="/employees" component={EmployeesPage} />
         <Route path="/employees/:id" component={EmployeeDetailPage} />
         <Route path="/clients" component={ClientsPage} />
+        <Route path="/clients/:id" component={ClientDetailPage} />
         <Route path="/departments" component={DepartmentsPage} />
         <Route path="/reports" component={DailyReportsPage} />
         <Route path="/analytics" component={AnalyticsPage} />
         <Route path="/my-tasks" component={MyTasksPage} />
         <Route path="/my-reports" component={MyReportsPage} />
-        <Route path="/settings/trello" component={TrelloSettingsPage} />
+        <Route path="/settings/workspaces" component={DepartmentWorkspacesPage} />
         <Route path="/settings/users" component={UserManagementPage} />
+        <Route path="/settings/trello" component={TrelloSettingsPage} />
+        {user && ["admin", "super_admin"].includes(user.role) ? (
+          <Route path="/settings/developer-hub" component={DeveloperHubSettingsPage} />
+        ) : null}
         <Route path="/alerts" component={AlertsPage} />
         <Route path="/help" component={HelpCenterPage} />
         <Route path="/help/:slug" component={HelpArticlePage} />
