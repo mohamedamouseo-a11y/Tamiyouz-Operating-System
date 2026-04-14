@@ -10,7 +10,10 @@ import { Loader2, Github, GitBranch, CheckCircle, XCircle, Upload, RefreshCw, Te
 import { toast } from "sonner";
 import { ScrollArea } from "@/components/ui/scroll-area";
 
-type LogEvent = { type: "log" | "progress" | "success" | "error"; message: string; progress?: number };
+type SseEvent =
+  | { type: "progress"; message: string; progress: number }
+  | { type: "log"; level: "info" | "warning" | "error"; message: string }
+  | { type: "complete"; ok: boolean; message: string; progress?: number };
 
 export default function DeveloperHubSettingsPage() {
   const { data: status, isLoading, refetch } = trpc.developerHub.get.useQuery();
@@ -23,7 +26,7 @@ export default function DeveloperHubSettingsPage() {
   const [commitMsg, setCommitMsg] = useState("chore: automated sync");
   const [syncing, setSyncing] = useState(false);
   const [syncProgress, setSyncProgress] = useState(0);
-  const [logs, setLogs] = useState<LogEvent[]>([]);
+  const [logs, setLogs] = useState<SseEvent[]>([]);
   const logsEndRef = useRef<HTMLDivElement>(null);
 
   useEffect(() => {
@@ -40,12 +43,22 @@ export default function DeveloperHubSettingsPage() {
   }, [logs]);
 
   const saveMutation = trpc.developerHub.save.useMutation({
-    onSuccess: () => { toast.success("Developer Hub settings saved"); setGithubToken(""); refetch(); },
+    onSuccess: () => {
+      toast.success("Developer Hub settings saved");
+      setGithubToken("");
+      refetch();
+    },
     onError: (err) => toast.error(err.message),
   });
 
   const handleSave = () => {
-    saveMutation.mutate({ repoPath, githubRepo, githubToken: githubToken || undefined, defaultBranch, isEnabled });
+    saveMutation.mutate({
+      repoPath,
+      githubRepo,
+      githubToken: githubToken || undefined,
+      defaultBranch,
+      isEnabled,
+    });
   };
 
   const handleSync = () => {
@@ -53,30 +66,51 @@ export default function DeveloperHubSettingsPage() {
     setSyncing(true);
     setSyncProgress(0);
     setLogs([]);
+
     const url = `/api/developer-hub/sync?message=${encodeURIComponent(commitMsg)}`;
     const es = new EventSource(url);
+
     es.onmessage = (e) => {
       try {
-        const event = JSON.parse(e.data) as LogEvent;
-        setLogs(prev => [...prev, event]);
-        if (event.progress !== undefined) setSyncProgress(event.progress);
-        if (event.type === "success" || event.type === "error") {
+        const event = JSON.parse(e.data) as SseEvent;
+        setLogs((prev) => [...prev, event]);
+
+        if (event.type === "progress") {
+          setSyncProgress(event.progress);
+        }
+
+        if (event.type === "complete") {
+          // Close the stream before updating state
           es.close();
           setSyncing(false);
-          if (event.type === "success") { toast.success("Sync complete!"); refetch(); }
-          else toast.error("Sync failed");
+
+          if (event.ok) {
+            setSyncProgress(event.progress ?? 100);
+            toast.success(event.message || "Sync complete!");
+            refetch();
+          } else {
+            toast.error(event.message || "Sync failed");
+          }
         }
-      } catch { /* ignore parse errors */ }
+      } catch {
+        // Ignore JSON parse errors
+      }
     };
+
     es.onerror = () => {
+      // Connection lost — do NOT infer success from this
       es.close();
       setSyncing(false);
-      toast.error("Connection to sync stream lost");
+      toast.error("Sync connection lost. Please try again.");
     };
   };
 
   if (isLoading) {
-    return <div className="flex items-center justify-center h-64"><Loader2 className="h-8 w-8 animate-spin text-primary" /></div>;
+    return (
+      <div className="flex items-center justify-center h-64">
+        <Loader2 className="h-8 w-8 animate-spin text-primary" />
+      </div>
+    );
   }
 
   return (
@@ -98,43 +132,50 @@ export default function DeveloperHubSettingsPage() {
         <CardContent>
           <div className="grid grid-cols-2 gap-3 text-sm">
             <div>
-              <p className="text-muted-foreground text-xs mb-1">Configuration</p>
-              {status?.configured
-                ? <Badge variant="default"><CheckCircle className="h-3 w-3 mr-1" />Configured</Badge>
-                : <Badge variant="secondary"><XCircle className="h-3 w-3 mr-1" />Not Configured</Badge>}
+              <span className="text-muted-foreground">Status</span>
+              <div className="mt-1">
+                {status?.configured ? (
+                  <Badge variant="default" className="gap-1">
+                    <CheckCircle className="h-3 w-3" /> Configured
+                  </Badge>
+                ) : (
+                  <Badge variant="secondary" className="gap-1">
+                    <XCircle className="h-3 w-3" /> Not configured
+                  </Badge>
+                )}
+              </div>
             </div>
             <div>
-              <p className="text-muted-foreground text-xs mb-1">GitHub Token</p>
-              {status?.hasToken
-                ? <Badge variant="default"><CheckCircle className="h-3 w-3 mr-1" />Token Set</Badge>
-                : <Badge variant="destructive"><XCircle className="h-3 w-3 mr-1" />No Token</Badge>}
+              <span className="text-muted-foreground">Branch</span>
+              <div className="mt-1 font-mono text-xs">{status?.currentBranch ?? "—"}</div>
             </div>
-            {status?.currentBranch && (
-              <div>
-                <p className="text-muted-foreground text-xs mb-1">Current Branch</p>
-                <code className="text-xs bg-muted px-1 py-0.5 rounded">{status.currentBranch}</code>
+            <div>
+              <span className="text-muted-foreground">Git Status</span>
+              <div className="mt-1 font-mono text-xs">{status?.gitStatus ?? "—"}</div>
+            </div>
+            <div>
+              <span className="text-muted-foreground">Last Commit</span>
+              <div className="mt-1 font-mono text-xs">{status?.lastCommitSha ?? "—"}</div>
+            </div>
+            <div>
+              <span className="text-muted-foreground">Last Push</span>
+              <div className="mt-1 text-xs">
+                {status?.lastPushAt ? new Date(status.lastPushAt).toLocaleString() : "Never"}
               </div>
-            )}
-            {status?.lastCommitSha && (
-              <div>
-                <p className="text-muted-foreground text-xs mb-1">Last Commit</p>
-                <code className="text-xs bg-muted px-1 py-0.5 rounded">{status.lastCommitSha}</code>
+            </div>
+            <div>
+              <span className="text-muted-foreground">Token</span>
+              <div className="mt-1">
+                {status?.hasToken ? (
+                  <Badge variant="outline" className="text-xs">Set</Badge>
+                ) : (
+                  <Badge variant="destructive" className="text-xs">Missing</Badge>
+                )}
               </div>
-            )}
-            {status?.gitStatus && (
-              <div className="col-span-2">
-                <p className="text-muted-foreground text-xs mb-1">Working Tree</p>
-                <pre className="text-xs bg-muted p-2 rounded max-h-24 overflow-auto">{status.gitStatus}</pre>
-              </div>
-            )}
-            {status?.lastPushAt && (
-              <div className="col-span-2">
-                <p className="text-muted-foreground text-xs">Last sync: {new Date(status.lastPushAt).toLocaleString()}</p>
-              </div>
-            )}
+            </div>
           </div>
-          <Button variant="ghost" size="sm" className="mt-3" onClick={() => refetch()}>
-            <RefreshCw className="h-3 w-3 mr-1" /> Refresh Status
+          <Button variant="ghost" size="sm" className="mt-3 gap-1" onClick={() => refetch()}>
+            <RefreshCw className="h-3.5 w-3.5" /> Refresh
           </Button>
         </CardContent>
       </Card>
@@ -142,40 +183,54 @@ export default function DeveloperHubSettingsPage() {
       {/* ── Config Card ─────────────────────────────── */}
       <Card>
         <CardHeader>
-          <CardTitle className="text-base">Repository Configuration</CardTitle>
-          <CardDescription>Set local path, GitHub repo, and access token</CardDescription>
+          <CardTitle className="text-base flex items-center gap-2">
+            <Github className="h-5 w-5" /> Configuration
+          </CardTitle>
+          <CardDescription>Connect your local repo to a GitHub repository</CardDescription>
         </CardHeader>
         <CardContent className="space-y-4">
           <div className="space-y-2">
-            <Label>Local Repository Path</Label>
-            <Input value={repoPath} onChange={e => setRepoPath(e.target.value)} placeholder="/var/www/tamiyouz_tos" />
+            <Label>Local Repo Path</Label>
+            <Input
+              value={repoPath}
+              onChange={(e) => setRepoPath(e.target.value)}
+              placeholder="/var/www/my-project"
+            />
           </div>
           <div className="space-y-2">
-            <Label>GitHub Repository (owner/repo)</Label>
-            <Input value={githubRepo} onChange={e => setGithubRepo(e.target.value)} placeholder="myorg/my-repo" />
+            <Label>GitHub Repo</Label>
+            <Input
+              value={githubRepo}
+              onChange={(e) => setGithubRepo(e.target.value)}
+              placeholder="owner/repo-name"
+            />
           </div>
           <div className="space-y-2">
-            <Label>Default Branch</Label>
-            <Input value={defaultBranch} onChange={e => setDefaultBranch(e.target.value)} placeholder="main" />
-          </div>
-          <div className="space-y-2">
-            <Label>GitHub Token {status?.hasToken && <span className="text-xs text-muted-foreground">(leave blank to keep existing)</span>}</Label>
-            <div className="flex gap-2">
+            <Label>GitHub Token {status?.hasToken && <span className="text-muted-foreground text-xs">(already set — leave blank to keep)</span>}</Label>
+            <div className="relative">
               <Input
                 type={showToken ? "text" : "password"}
                 value={githubToken}
-                onChange={e => setGithubToken(e.target.value)}
-                placeholder={status?.hasToken ? "Token already set – enter new to replace" : "ghp_xxx..."}
-                className="flex-1"
+                onChange={(e) => setGithubToken(e.target.value)}
+                placeholder={status?.hasToken ? "Leave blank to keep current token" : "ghp_..."}
+                className="pr-10"
               />
-              <Button variant="ghost" size="icon" onClick={() => setShowToken(v => !v)}>
+              <button
+                type="button"
+                className="absolute right-2 top-1/2 -translate-y-1/2 text-muted-foreground hover:text-foreground"
+                onClick={() => setShowToken((v) => !v)}
+              >
                 {showToken ? <EyeOff className="h-4 w-4" /> : <Eye className="h-4 w-4" />}
-              </Button>
+              </button>
             </div>
           </div>
-          <div className="flex items-center gap-2">
-            <input type="checkbox" id="isEnabled" checked={isEnabled} onChange={e => setIsEnabled(e.target.checked)} className="h-4 w-4" />
-            <label htmlFor="isEnabled" className="text-sm">Enabled</label>
+          <div className="space-y-2">
+            <Label>Default Branch</Label>
+            <Input
+              value={defaultBranch}
+              onChange={(e) => setDefaultBranch(e.target.value)}
+              placeholder="main"
+            />
           </div>
           <Button onClick={handleSave} disabled={saveMutation.isPending}>
             {saveMutation.isPending ? <Loader2 className="h-4 w-4 mr-2 animate-spin" /> : null}
@@ -195,11 +250,17 @@ export default function DeveloperHubSettingsPage() {
         <CardContent className="space-y-4">
           <div className="space-y-2">
             <Label>Sync Message</Label>
-            <Input value={commitMsg} onChange={e => setCommitMsg(e.target.value)} placeholder="chore: automated sync" />
+            <Input
+              value={commitMsg}
+              onChange={(e) => setCommitMsg(e.target.value)}
+              placeholder="chore: automated sync"
+            />
           </div>
           <Button onClick={handleSync} disabled={syncing || !status?.configured}>
-            {syncing ? <Loader2 className="h-4 w-4 mr-2 animate-spin" /> : <Upload className="h-4 w-4 mr-2" />}
-            {syncing ? "Syncing…" : "Sync Now"}
+            {syncing
+              ? <Loader2 className="h-4 w-4 mr-2 animate-spin" />
+              : <Upload className="h-4 w-4 mr-2" />}
+            {syncing ? "Syncing\u2026" : "Sync Now"}
           </Button>
           {syncing && <Progress value={syncProgress} className="h-2" />}
           {logs.length > 0 && (
@@ -210,19 +271,44 @@ export default function DeveloperHubSettingsPage() {
               </div>
               <ScrollArea className="h-48 rounded border bg-muted/40 p-3">
                 <div className="space-y-1 font-mono text-xs">
-                  {logs.map((log, i) => (
-                    <div
-                      key={i}
-                      className={
-                        log.type === "error" ? "text-destructive" :
-                        log.type === "success" ? "text-green-600 dark:text-green-400" :
-                        log.type === "progress" ? "text-primary font-semibold" :
-                        "text-muted-foreground"
-                      }
-                    >
-                      {log.message}
-                    </div>
-                  ))}
+                  {logs.map((log, i) => {
+                    if (log.type === "complete") {
+                      return (
+                        <div
+                          key={i}
+                          className={log.ok
+                            ? "text-green-600 dark:text-green-400 font-semibold"
+                            : "text-destructive font-semibold"}
+                        >
+                          {log.ok ? "\u2713 " : "\u2717 "}{log.message}
+                        </div>
+                      );
+                    }
+                    if (log.type === "progress") {
+                      return (
+                        <div key={i} className="text-primary font-semibold">
+                          {log.message}
+                        </div>
+                      );
+                    }
+                    if (log.type === "log") {
+                      return (
+                        <div
+                          key={i}
+                          className={
+                            log.level === "error"
+                              ? "text-destructive"
+                              : log.level === "warning"
+                              ? "text-yellow-600 dark:text-yellow-400"
+                              : "text-muted-foreground"
+                          }
+                        >
+                          {log.message}
+                        </div>
+                      );
+                    }
+                    return null;
+                  })}
                   <div ref={logsEndRef} />
                 </div>
               </ScrollArea>
